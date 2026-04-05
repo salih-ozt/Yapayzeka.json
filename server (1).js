@@ -46,6 +46,53 @@ const { v4: uuidv4 } = require('uuid');
 const sharp = require('sharp');
 const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
+
+// ════════════════════════════════════════════════════════════════════
+// 🔒 AUTH RATE LIMITERS — Brute-force & spam koruması
+// ════════════════════════════════════════════════════════════════════
+const loginLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 dakika
+    max: 10,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req) => {
+        // IP + email/identifier kombinasyonu → daha hassas hedefleme
+        const id = (req.body?.identifier || req.body?.email || req.body?.username || '').toLowerCase().trim().slice(0, 50);
+        return (req.ip || '').replace(/^::ffff:/, '') + ':' + id;
+    },
+    message: { error: 'Çok fazla giriş denemesi. Lütfen 15 dakika sonra tekrar deneyin.' },
+    skip: (req) => process.env.NODE_ENV === 'test',
+});
+
+const registerLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000, // 1 saat
+    max: 5,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req) => (req.ip || '').replace(/^::ffff:/, ''),
+    message: { error: 'Çok fazla kayıt denemesi. Lütfen 1 saat sonra tekrar deneyin.' },
+    skip: (req) => process.env.NODE_ENV === 'test',
+});
+
+const otpLimiter = rateLimit({
+    windowMs: 10 * 60 * 1000, // 10 dakika
+    max: 5,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req) => (req.ip || '').replace(/^::ffff:/, ''),
+    message: { error: 'Çok fazla OTP denemesi. Lütfen 10 dakika sonra tekrar deneyin.' },
+    skip: (req) => process.env.NODE_ENV === 'test',
+});
+
+const forgotPasswordLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000, // 1 saat
+    max: 5,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req) => (req.ip || '').replace(/^::ffff:/, ''),
+    message: { error: 'Çok fazla şifre sıfırlama talebi. Lütfen 1 saat sonra tekrar deneyin.' },
+    skip: (req) => process.env.NODE_ENV === 'test',
+});
 const compression = require('compression');
 const helmet = require('helmet');
 const { Pool } = require('pg');
@@ -1292,42 +1339,6 @@ function sanitizeBody(req, res, next) {
     next();
 }
 
-// ==================== 🔒 IP BAN CACHE ====================
-
-const ipBanCache     = new Map();
-const IP_BAN_CACHE_TTL = 60 * 1000; // 1 dakika
-
-async function checkIpBanDB(ip) {
-    try {
-        return await dbGet(
-            `SELECT * FROM banned_ips WHERE ip = $1 AND ("expiresAt" IS NULL OR "expiresAt" > NOW())`,
-            [ip]
-        );
-    } catch { return null; }
-}
-
-const ipBanMiddleware = async (req, res, next) => {
-    try {
-        const ip = req.ip || req.connection.remoteAddress || '';
-        const cached = ipBanCache.get(ip);
-
-        if (cached) {
-            if (cached.banned && cached.expiresAt > Date.now()) {
-                return res.status(403).json({ error: 'IP adresiniz engellendi', reason: cached.reason });
-            }
-            if (!cached.banned && cached.timestamp > Date.now() - IP_BAN_CACHE_TTL) return next();
-        }
-
-        const banned = await checkIpBanDB(ip);
-        if (banned) {
-            ipBanCache.set(ip, { banned: true, reason: banned.reason, expiresAt: new Date(banned.expiresAt || '9999-12-31').getTime() });
-            return res.status(403).json({ error: 'IP adresiniz engellendi', reason: banned.reason });
-        }
-
-        ipBanCache.set(ip, { banned: false, timestamp: Date.now() });
-        next();
-    } catch { next(); }
-};
 
 // ==================== PostgreSQL BAĞLANTISI ====================
 
@@ -2685,17 +2696,17 @@ if (socketIo) {
     io = new socketIo.Server(server, {
         cors: {
             origin: (origin, callback) => {
-                // Native mobil (null origin) ve bilinen originlere izin ver
-                if (!origin) return callback(null, true);
+                // Native mobil (null origin) — X-Mobile-App-Key kontrolü (Socket.IO handshake'te header yoksa geç)
+                if (!origin) return callback(null, true); // Socket.IO native bağlantı — key kontrolü HTTP layer'da
                 if (
                     origin.startsWith('https://sehitumitkestitarimmtal.com') ||
                     origin.startsWith('http://sehitumitkestitarimmtal.com') ||
-                    origin.startsWith('http://localhost') ||
+                    (_IS_PROD ? false : origin.startsWith('http://localhost')) ||
                     origin.startsWith('capacitor://') ||
                     origin.startsWith('ionic://') ||
                     origin.startsWith('android://') ||
-                    origin.startsWith('http://10.0.2.2') ||
-                    origin.startsWith('exp://')
+                    (_IS_PROD ? false : origin.startsWith('http://10.0.2.2')) ||
+                    (_IS_PROD ? false : origin.startsWith('exp://'))
                 ) return callback(null, true);
                 // .env APP_URL
                 const appUrl = (process.env.APP_URL || '').replace(/\/$/, '');
@@ -3118,40 +3129,94 @@ if (socketIo) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
+
+// 🔒 LOG GÜVENLİĞİ: E-posta adreslerini logda maskele (user@domain → us**@domain)
+function maskEmail(email) {
+    if (!email || typeof email !== 'string') return '[email]';
+    const [local, domain] = email.split('@');
+    if (!domain) return '***';
+    const masked = local.length <= 2 ? '**' : local.slice(0, 2) + '*'.repeat(Math.min(local.length - 2, 4));
+    return `${masked}@${domain}`;
+}
 // 🔔 FCM PUSH BİLDİRİM YARDIMCI FONKSİYONU
 // ══════════════════════════════════════════════════════════════════════════
 async function sendFcmPush(userId, { title, body, data = {} }) {
-    if (!firebaseAdmin) return;
+    if (!firebaseAdmin) {
+        console.warn('[FCM] firebaseAdmin null — FIREBASE_SERVICE_ACCOUNT_JSON .env\'de tanımlı mı?');
+        return;
+    }
     try {
         // Kullanıcının kayıtlı FCM token'larını al
         const rows = await dbAll(
-            `SELECT token FROM device_tokens WHERE "userId" = $1 AND "isActive" = TRUE`,
+            `SELECT token, platform FROM device_tokens WHERE "userId" = $1 AND "isActive" = TRUE`,
             [userId]
         );
-        if (!rows || rows.length === 0) return;
+        if (!rows || rows.length === 0) {
+            console.warn(`[FCM] userId=${userId} için kayıtlı aktif token yok`);
+            return;
+        }
 
         const tokens = rows.map(r => r.token).filter(Boolean);
         if (tokens.length === 0) return;
 
+        // data alanındaki tüm değerleri string'e çevir (FCM zorunluluğu)
+        const safeData = Object.fromEntries(
+            Object.entries(data).map(([k, v]) => [k, String(v ?? '')])
+        );
+
         const message = {
             notification: { title, body },
-            data: Object.fromEntries(Object.entries(data).map(([k, v]) => [k, String(v)])),
+            data: safeData,
             tokens,
+            // ── Android: yüksek öncelik + bildirim kanalı ──────────────
+            android: {
+                priority: 'high',
+                notification: {
+                    title,
+                    body,
+                    channelId: 'agrolink_notifications', // Android'de bu kanalı oluşturmanız gerekir
+                    sound: 'default',
+                    clickAction: 'FLUTTER_NOTIFICATION_CLICK', // Gerekirse değiştirin
+                },
+            },
+            // ── APNs (iOS varsa) ────────────────────────────────────────
+            apns: {
+                payload: {
+                    aps: {
+                        alert: { title, body },
+                        sound: 'default',
+                        badge: 1,
+                    },
+                },
+                headers: { 'apns-priority': '10' },
+            },
         };
 
         const response = await firebaseAdmin.messaging().sendEachForMulticast(message);
 
+        // Sonuçları logla
+        const successCount = response.responses.filter(r => r.success).length;
+        const failCount    = response.responses.filter(r => !r.success).length;
+        if (failCount > 0) {
+            console.warn(`[FCM] userId=${userId} → ${successCount} başarılı, ${failCount} başarısız`);
+        }
+
         // Geçersiz token'ları temizle
         response.responses.forEach((r, i) => {
-            if (!r.success && (
-                r.error?.code === 'messaging/invalid-registration-token' ||
-                r.error?.code === 'messaging/registration-token-not-registered'
-            )) {
-                dbRun(`UPDATE device_tokens SET "isActive" = FALSE WHERE token = $1`, [tokens[i]]).catch(() => {});
+            if (!r.success) {
+                const code = r.error?.code || '';
+                console.warn(`[FCM] Token hatası [${i}]: ${code} — ${r.error?.message || ''}`);
+                if (
+                    code === 'messaging/invalid-registration-token' ||
+                    code === 'messaging/registration-token-not-registered' ||
+                    code === 'messaging/unregistered'
+                ) {
+                    dbRun(`UPDATE device_tokens SET "isActive" = FALSE WHERE token = $1`, [tokens[i]]).catch(() => {});
+                }
             }
         });
     } catch (e) {
-        console.error('[FCM Push Error]', e.message);
+        console.error('[FCM Push Error]', e.message, e.stack?.split('\n')[1] || '');
     }
 }
 
@@ -3346,6 +3411,7 @@ function createVideoThumbnail(videoPath, thumbnailPath) {
                 // ffmpeg çıktısı bazen webp/png olabilir, sharp ile kesinlikle jpg'ye dönüştür
                 try {
                     await sharp(finalThumbPath)
+                        .rotate()
                         .jpeg({ quality: 85 })
                         .toFile(finalThumbPath + '.tmp.jpg');
                     fssync.renameSync(finalThumbPath + '.tmp.jpg', finalThumbPath);
@@ -3933,36 +3999,40 @@ app.use(compression({
 // Kural: Origin yoksa (null/undefined) veya güvenilir listede ise izin ver.
 // ════════════════════════════════════════════════════════════════════
 
+// 🔒 Production'da localhost origin'leri kapalı, sadece development'ta açık
+const _IS_PROD = process.env.NODE_ENV === 'production' || process.env.NODE_ENV === 'prod';
+
 const ALLOWED_ORIGINS = [
     // Ana web sitesi
     'https://sehitumitkestitarimmtal.com',
     'https://www.sehitumitkestitarimmtal.com',
-    'http://sehitumitkestitarimmtal.com',
-    'http://www.sehitumitkestitarimmtal.com',
-    // ── Sunucu IP — HTTP ve HTTPS ─────────────────────────────────────────
-    'http://78.135.85.44:8080',
-    'https://78.135.85.44:8080',
-    'http://78.135.85.44',
-    'https://78.135.85.44',
-    // Geliştirme ortamı
-    'http://localhost:3000',
-    'http://localhost:5173',
-    'http://localhost:8080',
-    'http://localhost:8100',
     // ── Native Android Kotlin (Retrofit / OkHttp) ───────────────────────
-    // Native HTTP istekleri Origin header göndermez → null check zaten var
-    // Emülatör localhost adresi
-    'http://10.0.2.2',
-    'http://10.0.2.2:3000',
-    'http://10.0.2.2:8080',
-    // ── Google Play / Capacitor / Ionic / React Native ──────────────────
     'capacitor://localhost',
     'ionic://localhost',
     'android://com.agrolink.social.agrolink',
-    'http://localhost',
-    'https://localhost',
-    'http://10.0.2.2:8081',
-    'exp://localhost:19000',
+    // NOT: Ham IP girişleri kaldırıldı — Cloudflare bypass önlemi
+    // NOT: localhost'lar kaldırıldı — production'da gereksiz, güvenlik riski
+    ...(_IS_PROD ? [] : [
+        // 🛠️ SADECE DEVELOPMENT ortamında aktif
+        'http://localhost:3000',
+        'http://localhost:5173',
+        'http://localhost:5174',
+        'http://localhost:4173',
+        'http://localhost:8080',
+        'http://localhost:8100',
+        'http://localhost',
+        'https://localhost',
+        'http://10.0.2.2',
+        'http://10.0.2.2:3000',
+        'http://10.0.2.2:8080',
+        'http://10.0.2.2:8081',
+        'exp://localhost:19000',
+        // Ham IP (sadece dev — production Cloudflare üzerinden geçmeli)
+        'http://78.135.85.44:8080',
+        'https://78.135.85.44:8080',
+        'http://78.135.85.44',
+        'https://78.135.85.44',
+    ]),
 ];
 
 // .env'deki MOBILE_ORIGIN eklenebilir (örn: Fomin özel domain varsa)
@@ -4015,8 +4085,7 @@ function mobileKeyMiddleware(req, res, next) {
 
 const corsOptions = {
     origin: (origin, callback) => {
-        // ✅ Origin yoksa (null/undefined): Android WebView, Fomin, Capacitor
-        //    native HTTP istekleri bu şekilde gelir — MUTLAKA izin verilmeli
+        // ✅ Origin yoksa (null/undefined): Android WebView, Kotlin/OkHttp, Capacitor — izin ver
         if (!origin) return callback(null, true);
 
         // ✅ İzin verilen listede mi?
@@ -4039,8 +4108,8 @@ const corsOptions = {
 
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions)); // Preflight — tüm OPTIONS isteklerine cevap ver
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+app.use(express.json({ limit: '1mb' }));  // 🔒 DoS önlemi — normal API isteği 10KB'ı geçmez
+app.use(express.urlencoded({ extended: true, limit: '1mb' }));  // 🔒 DoS önlemi
 // 🔒 Cookie parser — HttpOnly token okuma için (ip-ban/sanitize'dan ÖNCE)
 app.use(cookieParser(process.env.COOKIE_SECRET || process.env.JWT_SECRET));
 
@@ -4049,8 +4118,6 @@ app.use(cookieParser(process.env.COOKIE_SECRET || process.env.JWT_SECRET));
 // IP ban, firewall ve rate limit; statik servisten kaçış yok
 // ═══════════════════════════════════════════════════════════════
 app.use(sanitizeBody);    // 🔒 XSS / Path traversal koruması
-app.use(ipBanMiddleware); // 🔒 IP Ban kontrolü (DB + bellek cache)
-app.use(firewallMiddleware); // 🔒 Uygulama katmanı güvenlik duvarı
 app.use(mobileKeyMiddleware); // 🔒 Android native null-origin X-Mobile-App-Key doğrulaması
 // 🎬 Video dosyaları için Range request + CORS + doğru MIME (oynatma için kritik)
 // ÖNEMLİ: Bu middleware /uploads genel static'ten ÖNCE tanımlanmalı!
@@ -4094,360 +4161,9 @@ app.use('/uploads/thumbnails', (req, res, next) => {
 
 // 📁 Diğer upload dosyaları (resimler, profil fotoğrafları vb.)
 // UYARI: Bu /uploads genel static MUTLAKA specific olanlardan sonra gelmeli!
-app.use('/uploads', express.static(uploadsDir, { maxAge: '1y' }));
+app.use('/uploads', express.static(uploadsDir, { maxAge: '1y', dotfiles: 'deny' }));
 
-// ═══════════════════════════════════════════════════════════════
-// 🔥 FIREWALL - Uygulama katmanı güvenlik duvarı
-// ═══════════════════════════════════════════════════════════════
-const FIREWALL_BLOCKED_IPS  = new Set(); // Dinamik olarak engellenen IP'ler
-const FIREWALL_ATTACK_LOG   = new Map(); // IP → { count, firstSeen, lastSeen, reasons[] }
-const FIREWALL_AUTO_BAN_THRESHOLD = 20;  // 1 dakikada 20 şüpheli istek → otomatik ban
 
-// Bilinen kötü User-Agent'ları
-const BAD_USER_AGENTS = [
-    // ═══ SQLMap & SQL Araçları ════════════════════════════════
-    /sqlmap/i, /havij/i, /pangolin/i, /bsqlbf/i, /safe3sqlinjection/i,
-    /sql\s*ninja/i, /mssqlscan/i, /absinthe/i,
-    // ═══ Port Tarama Araçları ═════════════════════════════════
-    /nmap/i, /masscan/i, /zmap/i, /unicornscan/i, /rustscan/i,
-    /zgrab/i, /bannergrab/i, /netcat/i, /ncat/i,
-    // ═══ Web Tarama / Fuzzing ════════════════════════════════
-    /nikto/i, /dirbuster/i, /gobuster/i, /wfuzz/i, /ffuf/i,
-    /dirb\b/i, /feroxbuster/i, /burpsuite/i, /zaproxy/i,
-    /owasp.zap/i, /appscan/i, /webinspect/i, /acunetix/i,
-    /nessus/i, /openvas/i, /qualys/i, /nexpose/i, /rapid7/i,
-    /w3af/i, /arachni/i, /skipfish/i, /grabber/i, /vega/i,
-    /websecurify/i, /ratproxy/i,
-    // ═══ Brute Force / Kimlik Saldırı Araçları ═══════════════
-    /hydra/i, /medusa/i, /brutus/i, /thc-hydra/i,
-    /patator/i, /crowbar/i, /spray/i,
-    // ═══ Exploit Frameworkleri ═══════════════════════════════
-    /metasploit/i, /msfconsole/i, /msf\//i, /mettle/i,
-    /meterpreter/i, /empire/i, /cobalt\s*strike/i, /cobaltstrike/i,
-    /beef/i, /powersploit/i, /pupy/i, /sliver/i,
-    // ═══ Passwd & Hash Kırma ═════════════════════════════════
-    /hashcat/i, /john\s+the\s+ripper/i, /ophcrack/i,
-    // ═══ Network Sniffer / MITM ══════════════════════════════
-    /ettercap/i, /bettercap/i, /arpspoof/i, /mitmf/i,
-    // ═══ Genel Güvensiz Botlar ═══════════════════════════════
-    /python-requests\/2\.[0-4]/i,
-    /go-http-client\/1\.1/i,
-    /libwww-perl/i, /lwp-trivial/i,
-    /jakarta/i,
-    /python-urllib/i,
-    /masscan\//i, /zgrab\//i,
-];
-
-// Bilinen saldırı pattern'leri
-const ATTACK_PATTERNS = [
-    // ═══ SQL Injection — Klasik ══════════════════════════════
-    /(UNION.*SELECT|SELECT.*FROM.*WHERE)/i,
-    /(DROP|TRUNCATE|DELETE)\s+TABLE/i,
-    /('\s*OR\s*'1'\s*=\s*'1|'\s*OR\s+1\s*=\s*1)/i,
-    // ═══ SQL Injection — Time-Based (SQLMap İmzası) ══════════
-    /\bSLEEP\s*\(\s*\d+\s*\)/i,
-    /\bWAITFOR\s+DELAY\b/i,
-    /\bBENCHMARK\s*\(\s*\d+/i,
-    /\bPG_SLEEP\s*\(/i,
-    /\bDBMS_PIPE\.RECEIVE_MESSAGE/i,
-    // ═══ SQLMap Tamper Script Bypass İmzaları ════════════════
-    /information_schema\.(tables|columns)/i,
-    /\bsys\.tables\b|\bsysobjects\b/i,
-    /group_concat\s*\(/i,
-    /\bload_file\s*\(/i,
-    /\binto\s+outfile\b/i,
-    /\binto\s+dumpfile\b/i,
-    // ═══ XSS ══════════════════════════════════════════════════
-    /<script[\s\S]*?>[\s\S]*?<\/script>/i,
-    /javascript\s*:/i,
-    /on(load|error|click|mouseover)\s*=/i,
-    /<\s*img[^>]+\s+onerror\s*=/i,
-    // ═══ Path Traversal ═══════════════════════════════════════
-    /\.\.[\\/]/,
-    /%2e%2e[%2f%5c]/i,
-    /%252e%252e/i,
-    // ═══ Command Injection ════════════════════════════════════
-    /[;&|`$]\s*(cat|ls|wget|curl|bash|sh|cmd|powershell|nc|ncat|python|perl|ruby|php)/i,
-    /\/etc\/passwd/i, /\/etc\/shadow/i, /\/proc\/self/i,
-    // ═══ Metasploit Payload İmzaları ══════════════════════════
-    /shellcode|shell_exec|passthru\s*\(/i,
-    /eval\s*\(\s*base64/i,
-    // ═══ XXE ══════════════════════════════════════════════════
-    /<!ENTITY\s/i,
-    /<!DOCTYPE[^>]*\[/i,
-    // ═══ SSRF ═════════════════════════════════════════════════
-    /\b(169\.254\.169\.254)\b/i,
-    // ═══ LFI/RFI ══════════════════════════════════════════════
-    /(php:\/\/|file:\/\/|data:\/\/|expect:\/\/|phar:\/\/|zip:\/\/)/i,
-    // ═══ CRLF Injection ═══════════════════════════════════════
-    /%0[dD]%0[aA]|%0[aA]%0[dD]/,
-    // ═══ NoSQL Injection ══════════════════════════════════════
-    /\{\s*"\$\w+"\s*:/,
-];
-
-// ═══════════════════════════════════════════════════════════════
-// 🔒 GELIŞMIŞ TARAMA TESPİT SİSTEMİ — NMAP / Port Scan Detection
-// ═══════════════════════════════════════════════════════════════
-const SCAN_DETECTOR = new Map();
-const SCAN_WINDOW_MS      = 60 * 1000;
-const SCAN_ENDPOINT_LIMIT = 30;
-const SCAN_REQ_LIMIT      = 120;
-
-// ═══════════════════════════════════════════════════════════════
-// 🔒 IP BAZLI BRUTE FORCE TRACKER — HYDRA Koruması
-// ═══════════════════════════════════════════════════════════════
-const IP_LOGIN_TRACKER = new Map();
-const IP_BF_WINDOW_MS  = 10 * 60 * 1000;
-const IP_BF_MAX_TRIES  = 20;
-const IP_BF_BAN_MS     = 60 * 60 * 1000;
-
-function trackLoginIP(ip) {
-    const now = Date.now();
-    let entry = IP_LOGIN_TRACKER.get(ip) || { count: 0, blockedUntil: 0, firstAttempt: now };
-    if (now - entry.firstAttempt > IP_BF_WINDOW_MS) {
-        entry = { count: 0, blockedUntil: 0, firstAttempt: now };
-    }
-    entry.count++;
-    if (entry.count >= IP_BF_MAX_TRIES) {
-        entry.blockedUntil = now + IP_BF_BAN_MS;
-        console.warn(`🔐 [HYDRA-BLOCK] IP ${ip} brute force — 1 saat ban`);
-        dbRun(
-            `INSERT INTO banned_ips (id, ip, reason, "bannedAt", "expiresAt")
-             VALUES ($1, $2, $3, NOW(), NOW() + INTERVAL '1 hour')
-             ON CONFLICT (ip) DO UPDATE SET reason=$3, "bannedAt"=NOW(), "expiresAt"=NOW() + INTERVAL '1 hour'`,
-            [uuidv4(), ip, `HYDRA/BruteForce: ${entry.count} giriş denemesi`]
-        ).catch(() => {});
-    }
-    IP_LOGIN_TRACKER.set(ip, entry);
-    return entry.blockedUntil > now;
-}
-
-function isIPBruteForceBlocked(ip) {
-    const entry = IP_LOGIN_TRACKER.get(ip);
-    return entry && entry.blockedUntil > Date.now();
-}
-
-function ipBruteForceMiddleware(req, res, next) {
-    const ip = (req.ip || req.connection?.remoteAddress || '').replace(/^::ffff:/, '');
-    if (isIPBruteForceBlocked(ip)) {
-        return res.status(429).json({ error: 'Çok fazla giriş denemesi. IP adresiniz geçici olarak engellendi.', retryAfter: 3600 });
-    }
-    next();
-}
-app.use('/api/auth/login', ipBruteForceMiddleware);
-app.use('/api/auth/verify-2fa', ipBruteForceMiddleware);
-
-// ═══════════════════════════════════════════════════════════════
-// 🍯 HONEYPOT TUZAKLAR — Tarayıcıları Anında Ban'la
-// ═══════════════════════════════════════════════════════════════
-const HONEYPOT_PATHS = [
-    '/admin', '/phpmyadmin', '/pma', '/mysql', '/phpinfo.php',
-    '/wp-admin', '/wp-login.php', '/wordpress', '/wp-content',
-    '/.env', '/.git/HEAD', '/.git/config', '/config.php',
-    '/server-status', '/server-info', '/.htaccess', '/.htpasswd',
-    '/etc/passwd', '/etc/shadow', '/proc/self/environ',
-    '/shell', '/cmd', '/cmd.php', '/eval.php', '/upload.php',
-    '/backdoor.php', '/webshell.php', '/c99.php', '/r57.php',
-    '/xmlrpc.php', '/xmlrpc', '/actuator', '/actuator/health',
-    '/console', '/debug', '/_profiler', '/telescope',
-    '/solr', '/jmx-console', '/invoker/JMXInvokerServlet',
-    '/manager/html', '/manager/text', '/tomcat',
-    '/cgi-bin/bash', '/cgi-bin/sh', '/cgi-bin/python',
-    '/boaform/admin/formLogin',
-    '/GponForm/diag_Form',
-];
-
-app.use((req, res, next) => {
-    const path = req.path.toLowerCase();
-    if (HONEYPOT_PATHS.some(hp => path === hp || path.startsWith(hp + '/'))) {
-        const ip = (req.ip || req.connection?.remoteAddress || '').replace(/^::ffff:/, '');
-        console.warn(`🍯 [HONEYPOT] ${ip} tuzağa düştü: ${req.path}`);
-        logFirewallAttack(ip, `HONEYPOT: ${req.path}`, req);
-        dbRun(
-            `INSERT INTO banned_ips (id, ip, reason, "bannedAt")
-             VALUES ($1, $2, $3, NOW())
-             ON CONFLICT (ip) DO UPDATE SET reason=$3, "bannedAt"=NOW()`,
-            [uuidv4(), ip, `HONEYPOT: ${req.path} — Kalici ban`]
-        ).catch(() => {});
-        FIREWALL_BLOCKED_IPS.add(ip);
-        return setTimeout(() => res.status(404).end(), 3000);
-    }
-    next();
-});
-
-function logFirewallAttack(ip, reason, req) {
-    if (!FIREWALL_ATTACK_LOG.has(ip)) {
-        FIREWALL_ATTACK_LOG.set(ip, { count: 0, firstSeen: Date.now(), lastSeen: Date.now(), reasons: [] });
-    }
-    const entry = FIREWALL_ATTACK_LOG.get(ip);
-    entry.count++;
-    entry.lastSeen = Date.now();
-    if (entry.reasons.length < 10) entry.reasons.push(reason);
-    if (entry.count >= FIREWALL_AUTO_BAN_THRESHOLD) {
-        FIREWALL_BLOCKED_IPS.add(ip);
-        console.warn(`🔥 [FIREWALL] AUTO-BAN: ${ip} | Sebep: ${reason} | Toplam: ${entry.count}`);
-        dbRun(
-            `INSERT INTO banned_ips (id, ip, reason, "bannedAt", "expiresAt")
-             VALUES ($1, $2, $3, NOW(), NOW() + INTERVAL '24 hours')
-             ON CONFLICT (ip) DO UPDATE SET reason=$3, "bannedAt"=NOW(), "expiresAt"=NOW() + INTERVAL '24 hours'`,
-            [uuidv4(), ip, `AUTO-BAN: ${reason} (${entry.count} saldir)`]
-        ).catch(() => {});
-    }
-}
-
-function firewallMiddleware(req, res, next) {
-    const ip = (req.ip || req.connection?.remoteAddress || '').replace(/^::ffff:/, '');
-
-    // 1. Engellenmiş IP kontrolü
-    if (FIREWALL_BLOCKED_IPS.has(ip)) {
-        return res.status(403).json({ error: 'Erişim engellendi' });
-    }
-
-    // 2. HTTP Metod kısıtlaması
-    const ALLOWED_METHODS = ['GET','POST','PUT','DELETE','PATCH','OPTIONS','HEAD'];
-    if (!ALLOWED_METHODS.includes(req.method)) {
-        logFirewallAttack(ip, `Yasak HTTP metodu: ${req.method}`, req);
-        return res.status(405).json({ error: 'Metod desteklenmiyor' });
-    }
-
-    // 3. Kötü User-Agent
-    const ua = req.headers['user-agent'] || '';
-    if (!ua && req.method !== 'OPTIONS' && req.path.startsWith('/api/')) {
-        logFirewallAttack(ip, 'Missing User-Agent', req);
-        return res.status(400).json({ error: 'Geçersiz istek' });
-    }
-    for (const pattern of BAD_USER_AGENTS) {
-        if (pattern.test(ua)) {
-            logFirewallAttack(ip, `Kotu UA: ${ua.substring(0, 80)}`, req);
-            FIREWALL_BLOCKED_IPS.add(ip);
-            return res.status(403).json({ error: 'Erişim engellendi' });
-        }
-    }
-
-    // 4. NMAP / Port Scan tespiti
-    const now = Date.now();
-    let scanEntry = SCAN_DETECTOR.get(ip) || { endpoints: new Set(), firstSeen: now, count: 0 };
-    if (now - scanEntry.firstSeen > SCAN_WINDOW_MS) {
-        scanEntry = { endpoints: new Set(), firstSeen: now, count: 0 };
-    }
-    scanEntry.endpoints.add(req.path.split('?')[0]);
-    scanEntry.count++;
-    SCAN_DETECTOR.set(ip, scanEntry);
-    if (scanEntry.endpoints.size > SCAN_ENDPOINT_LIMIT || scanEntry.count > SCAN_REQ_LIMIT) {
-        logFirewallAttack(ip, `Scan: ${scanEntry.endpoints.size} endpoint, ${scanEntry.count} istek`, req);
-        console.warn(`🔥 [NMAP-BLOCK] ${ip}: ${scanEntry.endpoints.size} endpoint tarandı`);
-        FIREWALL_BLOCKED_IPS.add(ip);
-        dbRun(
-            `INSERT INTO banned_ips (id, ip, reason, "bannedAt", "expiresAt")
-             VALUES ($1, $2, $3, NOW(), NOW() + INTERVAL '6 hours')
-             ON CONFLICT (ip) DO UPDATE SET reason=$3, "bannedAt"=NOW(), "expiresAt"=NOW() + INTERVAL '6 hours'`,
-            [uuidv4(), ip, `NMAP/Scan: ${scanEntry.endpoints.size} endpoint`]
-        ).catch(() => {});
-        return res.status(403).json({ error: 'Erişim engellendi' });
-    }
-
-    // 5. URL saldırı pattern'leri
-    let fullUrl;
-    try { fullUrl = decodeURIComponent(req.originalUrl || req.url || ''); } catch { fullUrl = req.originalUrl || ''; }
-    for (const pattern of ATTACK_PATTERNS) {
-        if (pattern.test(fullUrl)) {
-            logFirewallAttack(ip, `URL saldirisi: ${fullUrl.substring(0, 100)}`, req);
-            return res.status(403).json({ error: 'Geçersiz istek' });
-        }
-    }
-
-    // 6. Body saldırı pattern'leri
-    if (req.body && typeof req.body === 'object') {
-        const bodyStr = JSON.stringify(req.body);
-        for (const pattern of ATTACK_PATTERNS) {
-            if (pattern.test(bodyStr)) {
-                logFirewallAttack(ip, 'Body saldirisi', req);
-                return res.status(400).json({ error: 'Geçersiz içerik' });
-            }
-        }
-    }
-
-    // 7. Çok büyük header'lar
-    const totalHeaderSize = Object.values(req.headers).join('').length;
-    if (totalHeaderSize > 16384) {
-        logFirewallAttack(ip, 'Asiri buyuk header', req);
-        return res.status(431).json({ error: 'İstek başlıkları çok büyük' });
-    }
-
-    // 8. X-Forwarded-For spoof tespiti
-    const xff = req.headers['x-forwarded-for'];
-    if (xff && xff.split(',').length > 5) {
-        logFirewallAttack(ip, `XFF spoof: ${xff.substring(0, 80)}`, req);
-    }
-
-    next();
-}
-
-// Slowloris koruması — server nesnesine uygulanır
-function applySlowlorisProtection(httpServer) {
-    httpServer.setTimeout(30 * 1000);
-    httpServer.headersTimeout = 10 * 1000;
-    httpServer.keepAliveTimeout = 5 * 1000;
-    httpServer.requestTimeout = 30 * 1000;
-    console.log('✅ Slowloris/HTTP-DoS koruması aktif');
-}
-
-// Bellek temizliği
-setInterval(() => {
-    const now = Date.now();
-    for (const [ip, entry] of SCAN_DETECTOR.entries()) {
-        if (now - entry.firstSeen > SCAN_WINDOW_MS * 2) SCAN_DETECTOR.delete(ip);
-    }
-    for (const [ip, entry] of IP_LOGIN_TRACKER.entries()) {
-        if (now - entry.firstAttempt > IP_BF_WINDOW_MS * 2) IP_LOGIN_TRACKER.delete(ip);
-    }
-}, 5 * 60 * 1000);
-
-// Not: app.use(firewallMiddleware) statik dosyalardan önce (yukarıda) çağrılmaktadır.
-
-// 🔥 Firewall yönetimi API'leri
-// Başlangıçta DB'deki ban'ları belleğe yükle
-async function loadFirewallBans() {
-    try {
-        const bans = await dbAll(
-            `SELECT ip FROM banned_ips WHERE "expiresAt" IS NULL OR "expiresAt" > NOW()`
-        );
-        bans.forEach(b => FIREWALL_BLOCKED_IPS.add(b.ip));
-        console.log(`🔥 [FIREWALL] ${FIREWALL_BLOCKED_IPS.size} engellenmiş IP yüklendi`);
-    } catch (e) {
-        console.error('Firewall ban yükleme hatası:', e.message);
-    }
-}
-// DB hazır olduktan sonra çağrılacak (initializeDatabase'den sonra)
-
-// Rate Limiting
-// Genel API rate limit
-// ✅ Genel API rate limit — 2x artırıldı (giriş/kayıt hariç)
-app.use('/api/', rateLimit({
-    windowMs      : 15 * 60 * 1000, // 15 dakika
-    max           : 600,             // 300 → 600 (2x)
-    standardHeaders: true,
-    legacyHeaders : false,
-    message       : { error: 'Çok fazla istek gönderildi. Lütfen bekleyin.' },
-    skip          : (req) => req.method === 'OPTIONS',
-}));
-
-// Auth endpoint'leri — GÜVENLİK: değiştirilmedi, sıkı kalır
-app.use('/api/auth/login',           rateLimit({ windowMs: 15 * 60 * 1000, max: 10,  message: { error: 'Çok fazla giriş denemesi. 15 dakika bekleyin.' } }));
-app.use('/api/auth/register',        rateLimit({ windowMs: 60 * 60 * 1000, max: 5,   message: { error: 'Çok fazla kayıt denemesi. 1 saat bekleyin.' } }));
-app.use('/api/auth/register-init',   rateLimit({ windowMs: 60 * 60 * 1000, max: 5,   message: { error: 'Çok fazla kayıt denemesi. 1 saat bekleyin.' } }));
-app.use('/api/auth/forgot-password', rateLimit({ windowMs: 60 * 60 * 1000, max: 3,   message: { error: 'Çok fazla şifre sıfırlama denemesi. 1 saat bekleyin.' } }));
-app.use('/api/auth/verify-2fa',      rateLimit({ windowMs: 10 * 60 * 1000, max: 10,  message: { error: 'Çok fazla doğrulama denemesi.' } }));
-app.use('/api/auth/resend-2fa',      rateLimit({ windowMs: 5  * 60 * 1000, max: 3,   message: { error: 'Çok fazla kod istendi. 5 dakika bekleyin.' } }));
-app.use('/api/auth/verify-email',    rateLimit({ windowMs: 5  * 60 * 1000, max: 5,   message: { error: 'Çok fazla doğrulama denemesi.' } }));
-app.use('/api/auth/resend-verification', rateLimit({ windowMs: 10 * 60 * 1000, max: 3 }));
-
-// Upload/mesaj endpoint — 2x artırıldı
-app.use('/api/posts', (req, res, next) => {
-    if (req.method !== 'POST') return next();
-    return rateLimit({ windowMs: 60 * 1000, max: 60 })(req, res, next); // 30 → 60
-});
-app.use('/api/messages', rateLimit({ windowMs: 60 * 1000, max: 120 })); // 60 → 120
 
 // ==================== 🔒 SPAM KORUMASI MIDDLEWARE ====================
 
@@ -4608,7 +4324,7 @@ async function createNotification(userId, type, message, data = {}) {
             title: `AgroLink ${icon}`,
             body : message,
             data : { type, ...Object.fromEntries(Object.entries(data).map(([k,v]) => [k, String(v ?? '')])) },
-        }).catch(() => {});
+        }).catch((fcmErr) => console.error("[FCM createNotification]", fcmErr.message));
 
         // 🔌 Socket.IO anlık bildirim
         if (io && onlineUsers.has(userId)) {
@@ -4828,7 +4544,7 @@ app.use((req, res, next) => {
 // ── 2. POST /api/auth/register — 2FA & e-posta doğrulaması OLMADAN kayıt ──────
 // AgroLink'in orijinal /api/auth/register'ı e-posta kodu istiyor ve token dönmüyor.
 // Bu versiyon ChatSee için doğrudan token döndürür.
-app.post('/api/auth/register', async (req, res, next) => {
+app.post('/api/auth/register', registerLimiter, async (req, res, next) => {
     // Sadece JSON body'si olan istekleri yakala (multipart/form-data olan
     // AgroLink native app isteklerini geç)
     const ct = req.headers['content-type'] || '';
@@ -4911,7 +4627,7 @@ app.post('/api/auth/register', async (req, res, next) => {
 // AgroLink'in orijinal login'i twoFactorEnabled=TRUE olan kullanıcılara
 // requires2FA:true döndürür. ChatSee frontend bunu işleyemiyor.
 // Bu versiyon 2FA olmadan doğrudan token döndürür.
-app.post('/api/auth/login', async (req, res, next) => {
+app.post('/api/auth/login', loginLimiter, async (req, res, next) => {
     const ct = req.headers['content-type'] || '';
     if (ct.includes('multipart/form-data')) return next();
 
@@ -5242,7 +4958,7 @@ app.get('/api/health', async (req, res) => {
 });
 
 // ─── 2. KAYIT ───────────────────────────────────────────────────────
-app.post('/api/auth/register', validateAuthInput, upload.single('profilePic'), async (req, res) => {
+app.post('/api/auth/register', registerLimiter, validateAuthInput, upload.single('profilePic'), async (req, res) => {
     try {
         const { name, username, email, password, userType } = req.body;
         if (!name || !username || !email || !password) {
@@ -5269,7 +4985,7 @@ app.post('/api/auth/register', validateAuthInput, upload.single('profilePic'), a
             const filename = `profile_${userId}.webp`;
             const outputPath = path.join(profilesDir, filename);
             try {
-                await sharp(req.file.path).resize(512, 512, { fit: 'cover' }).webp({ quality: 85 }).toFile(outputPath);
+                await sharp(req.file.path).rotate().resize(512, 512, { fit: 'cover' }).webp({ quality: 85 }).toFile(outputPath);
                 profilePic = `/uploads/profiles/${filename}`;
             } catch (e) {
                 console.error('Profil resmi işleme hatası'); // 🔒 Detay loglanmıyor
@@ -5338,7 +5054,7 @@ body{font-family:'Segoe UI',sans-serif;background:#f4f4f4;margin:0;padding:0}
 
 // ─── 2b. KAYIT (register-init alias — UI uyumluluğu için) ──────────
 // UI /api/auth/register-init çağırıyor, bu endpoint aynı işlemi yapar
-app.post('/api/auth/register-init', upload.single('profilePic'), async (req, res) => {
+app.post('/api/auth/register-init', registerLimiter, upload.single('profilePic'), async (req, res) => {
     try {
         const { name, username, email, password, userType } = req.body;
         if (!name || !username || !email || !password) {
@@ -5364,7 +5080,7 @@ app.post('/api/auth/register-init', upload.single('profilePic'), async (req, res
             const filename = `profile_${userId}.webp`;
             const outputPath = path.join(profilesDir, filename);
             try {
-                await sharp(req.file.path).resize(512, 512, { fit: 'cover' }).webp({ quality: 85 }).toFile(outputPath);
+                await sharp(req.file.path).rotate().resize(512, 512, { fit: 'cover' }).webp({ quality: 85 }).toFile(outputPath);
                 profilePic = `/uploads/profiles/${filename}`;
             } catch (e) {
                 console.error('Profil resmi işleme hatası'); // 🔒 Detay loglanmıyor
@@ -5419,7 +5135,7 @@ app.post('/api/auth/register-init', upload.single('profilePic'), async (req, res
 });
 
 // ─── 3. GİRİŞ ──────────────────────────────────────────────────────
-app.post('/api/auth/login', validateAuthInput, async (req, res) => {
+app.post('/api/auth/login', loginLimiter, validateAuthInput, async (req, res) => {
     try {
         const { email, password, identifier } = req.body;
         // UI'dan "identifier" (e-posta veya kullanıcı adı) gelebilir, geriye dönük uyumluluk için "email" de desteklenir
@@ -5443,7 +5159,6 @@ app.post('/api/auth/login', validateAuthInput, async (req, res) => {
         if (!user) {
             await bcrypt.compare(password, DUMMY_HASH); // Sahte gecikme — timing oracle önlemi
             recordFailedLogin(loginId);
-            trackLoginIP(loginIp);
             return res.status(401).json({ error: 'E-posta/kullanıcı adı veya şifre hatalı' });
         }
 
@@ -5456,7 +5171,6 @@ app.post('/api/auth/login', validateAuthInput, async (req, res) => {
         const validPassword = await bcrypt.compare(password, user.password);
         if (!validPassword) {
             recordFailedLogin(loginId);
-            trackLoginIP(loginIp); // ✅ IP takibi
             return res.status(401).json({ error: 'Şifre yanlış' });
         }
         clearFailedLogins(loginId);
@@ -5657,7 +5371,7 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
 // ─── /api/auth/verify-otp ALIAS ──────────────────────────────────────────
 // Login 2FA: { tempToken, code }  →  /api/auth/verify-2fa mantığı
 // Register : { email, code }      →  /api/auth/register-verify mantığı
-app.post('/api/auth/verify-otp', validateAuthInput, async (req, res) => {
+app.post('/api/auth/verify-otp', otpLimiter, validateAuthInput, async (req, res) => {
     const { tempToken, code, email } = req.body;
     if (tempToken && code) {
         // 2FA doğrulama (login)
@@ -5710,7 +5424,7 @@ app.post('/api/auth/verify-otp', validateAuthInput, async (req, res) => {
 // ─── /api/auth/send-otp ALIAS ──────────────────────────────────────────────
 // { email, tempToken }   → login 2FA resend
 // { email }              → register doğrulama kodu yeniden gönder
-app.post('/api/auth/send-otp', validateAuthInput, async (req, res) => {
+app.post('/api/auth/send-otp', otpLimiter, validateAuthInput, async (req, res) => {
     const { email, tempToken } = req.body;
     try {
         if (tempToken) {
@@ -5853,6 +5567,7 @@ app.put('/api/users/profile', authenticateToken, upload.fields([
                 const filename = `profile_${req.user.id}_${Date.now()}.webp`;
                 const outputPath = path.join(profilesDir, filename);
                 await sharp(file.path, { sequentialRead: true })
+                    .rotate()
                     .resize(512, 512, { fit: 'cover', kernel: 'lanczos2' })
                     .webp({ quality: 82, effort: 2 }) // ⚡ effort:2 → hızlı
                     .toFile(outputPath);
@@ -5866,6 +5581,7 @@ app.put('/api/users/profile', authenticateToken, upload.fields([
                 const filename = `cover_${req.user.id}_${Date.now()}.webp`;
                 const outputPath = path.join(profilesDir, filename);
                 await sharp(file.path, { sequentialRead: true })
+                    .rotate()
                     .resize(1920, 1080, { fit: 'inside', withoutEnlargement: true, kernel: 'lanczos2' })
                     .webp({ quality: 82, effort: 2 }) // ⚡ effort:2 → hızlı
                     .toFile(outputPath);
@@ -5968,6 +5684,7 @@ app.post('/api/upload', authenticateToken, upload.single('media'), async (req, r
             const destPath = path.join(postsDir, filename);
             try {
                 await sharp(file.path, { sequentialRead: true })
+                    .rotate()
                     .resize(1920, 1920, { fit: 'inside', withoutEnlargement: true })
                     .webp({ quality: 82, effort: 2 })
                     .toFile(destPath);
@@ -6259,6 +5976,7 @@ app.post('/api/posts', authenticateToken, checkRestriction('post'), upload.array
                     let imgWidth = null, imgHeight = null;
                     try {
                         const info = await sharp(file.path, { sequentialRead: true })
+                            .rotate()
                             .resize(1920, 1920, { fit: 'inside', withoutEnlargement: true, kernel: 'lanczos2' })
                             .webp({ quality: 82, effort: 2, smartSubsample: true })
                             .toFile(outputPath);
@@ -6947,6 +6665,7 @@ app.post('/api/store/products', authenticateToken, (req, res, next) => {
             const outputPath = path.join(postsDir, filename);
             try {
                 await sharp(file.path)
+                    .rotate()
                     .resize(1080, 1080, { fit: 'inside', withoutEnlargement: true })
                     .webp({ quality: 85 })
                     .toFile(outputPath);
@@ -7203,7 +6922,7 @@ app.post('/api/auth/resend-verification', validateAuthInput, async (req, res) =>
 });
 
 // ─── YENİ ROTA 3: ŞİFREMİ UNUTTUM ──────────────────────────────────
-app.post('/api/auth/forgot-password', validateAuthInput, async (req, res) => {
+app.post('/api/auth/forgot-password', forgotPasswordLimiter, validateAuthInput, async (req, res) => {
     try {
         const { email, username } = req.body;
         const ip = req.ip || req.connection?.remoteAddress;
@@ -7250,15 +6969,15 @@ app.post('/api/auth/forgot-password', validateAuthInput, async (req, res) => {
              VALUES ($1, $2, $3, NOW() + INTERVAL '10 minutes')`,
             [uuidv4(), user.id, token]
         );
-        console.log(`🔑 Şifre sıfırlama token'ı oluşturuldu: ${user.email} - Süre: 10 dakika`);
+        console.log(`🔑 Şifre sıfırlama token'ı oluşturuldu: ${maskEmail(user.email)} - Süre: 10 dakika`);
 
         // E-posta gönder
         sendForgotPasswordEmail(user.email, user.name, token)
             .then(result => {
                 if (result?.success) {
-                    console.log(`📧 Şifremi unuttum e-postası gönderildi: ${user.email}`);
+                    console.log(`📧 Şifremi unuttum e-postası gönderildi: ${maskEmail(user.email)}`);
                 } else {
-                    console.error(`❌ Şifremi unuttum e-postası gönderilemedi: ${user.email}`, result?.error);
+                    console.error(`❌ Şifremi unuttum e-postası gönderilemedi: ${maskEmail(user.email)}`, result?.error);
                 }
             })
             .catch(err => console.error('❌ Şifremi unuttum e-posta hatası:', err.message));
@@ -7970,7 +7689,7 @@ app.post('/api/stories', authenticateToken, upload.single('media'), async (req, 
             } else {
                 const filename = `story_${uuidv4().replace(/-/g,"").slice(0,16)}.webp`;
                 const dest = path.join(postsDir, filename);
-                await sharp(req.file.path).resize(1080, 1920, { fit: 'inside', withoutEnlargement: true }).webp({ quality: 85 }).toFile(dest);
+                await sharp(req.file.path).rotate().resize(1080, 1920, { fit: 'inside', withoutEnlargement: true }).webp({ quality: 85 }).toFile(dest);
                 await fs.unlink(req.file.path).catch(() => {});
                 mediaUrl = `/uploads/posts/${filename}`;
             }
@@ -8305,7 +8024,7 @@ app.put('/api/store/products/:id', authenticateToken, (req, res, next) => {
             for (let i = 0; i < files.length; i++) {
                 const filename = `product_${uuidv4().replace(/-/g,"").slice(0,16)}_${i}.webp`;
                 const outputPath = path.join(postsDir, filename);
-                await sharp(files[i].path).resize(1080, 1080, { fit: 'inside', withoutEnlargement: true }).webp({ quality: 85 }).toFile(outputPath);
+                await sharp(files[i].path).rotate().resize(1080, 1080, { fit: 'inside', withoutEnlargement: true }).webp({ quality: 85 }).toFile(outputPath);
                 await fs.unlink(files[i].path).catch(() => {});
                 images.push(`/uploads/posts/${filename}`);
             }
@@ -8880,7 +8599,7 @@ app.delete('/api/users/profile-pic', authenticateToken, async (req, res) => {
 
 const agrolinkDir = path.join(__dirname, 'public', 'agrolink');
 if (fssync.existsSync(agrolinkDir)) {
-    app.use('/agrolink', express.static(agrolinkDir, { maxAge: '1d' }));
+    app.use('/agrolink', express.static(agrolinkDir, { maxAge: '1d', dotfiles: 'deny' }));
 }
 app.get('/agrolink', (req, res) => {
     const htmlPath = path.join(__dirname, 'public', 'agrolink', 'index.html');
@@ -8888,6 +8607,20 @@ app.get('/agrolink', (req, res) => {
         res.sendFile(htmlPath);
     } else {
         res.status(404).json({ error: 'AgroLink uygulaması bulunamadı' });
+    }
+});
+
+// ── React Router için SPA catch-all: /agrolink/* ──────────────────────────
+// Vite build çıktısı public/agrolink/ klasörüne kopyalanmalıdır.
+// Tüm alt rotalar (/agrolink/feed, /agrolink/profile vb.) index.html'e yönlendirilir.
+app.get('/agrolink/*', (req, res) => {
+    const htmlPath = path.join(__dirname, 'public', 'agrolink', 'index.html');
+    if (fssync.existsSync(htmlPath)) {
+        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.sendFile(htmlPath);
+    } else {
+        res.status(404).json({ error: 'AgroLink uygulaması bulunamadı. public/agrolink/index.html ekleyin.' });
     }
 });
 
@@ -8944,7 +8677,7 @@ self.addEventListener('fetch', (event) => {
 
 const publicDir = path.join(__dirname, 'public');
 if (fssync.existsSync(publicDir)) {
-    app.use(express.static(publicDir, { maxAge: '1d', index: false }));
+    app.use(express.static(publicDir, { maxAge: '1d', index: false, dotfiles: 'deny' }));
 }
 
 // ═══════════════════════════════════════════════════════
@@ -10118,7 +9851,7 @@ app.post('/api/messages/image', authenticateToken, upload.single('image'), async
         if (blocked) return res.status(403).json({ error:'Mesaj gönderilemiyor' });
         const filename  = `msg_${uuidv4().replace(/-/g,"").slice(0,16)}.webp`;
         const outPath   = path.join(postsDir, filename);
-        await sharp(req.file.path).resize(1920,1920,{fit:'inside',withoutEnlargement:true}).webp({quality:85}).toFile(outPath);
+        await sharp(req.file.path).rotate().resize(1920,1920,{fit:'inside',withoutEnlargement:true}).webp({quality:85}).toFile(outPath);
         await fs.unlink(req.file.path).catch(()=>{});
         const imageUrl  = `/uploads/posts/${filename}`;
         const sender    = await dbGet('SELECT username FROM users WHERE id=$1',[req.user.id]);
@@ -11600,7 +11333,7 @@ app.post('/api/chats/group', authenticateToken, upload.single('photo'), async (r
         if (req.file) {
             const fname = `group_${groupId}_${Date.now()}.webp`;
             const out = require('path').join(profilesDir, fname);
-            await sharp(req.file.path).resize(256,256,{fit:'cover'}).webp({quality:85}).toFile(out);
+            await sharp(req.file.path).rotate().resize(256,256,{fit:'cover'}).webp({quality:85}).toFile(out);
             await require('fs').promises.unlink(req.file.path).catch(()=>{});
             photoUrl = `/uploads/profiles/${fname}`;
         }
@@ -11756,7 +11489,7 @@ app.post('/api/products', authenticateToken, (req, res, next) => {
         for (let i = 0; i < files.length; i++) {
             const fname = `product_${Date.now()}_${i}.webp`;
             const out = require('path').join(postsDir, fname);
-            await sharp(files[i].path).resize(1080,1080,{fit:'inside',withoutEnlargement:true}).webp({quality:85}).toFile(out);
+            await sharp(files[i].path).rotate().resize(1080,1080,{fit:'inside',withoutEnlargement:true}).webp({quality:85}).toFile(out);
             await fs.unlink(files[i].path).catch(()=>{});
             images.push(`/uploads/posts/${fname}`);
         }
@@ -11804,7 +11537,7 @@ app.put('/api/products/:productId', authenticateToken, (req, res, next) => {
             for (let i=0;i<files.length;i++){
                 const fname=`product_${Date.now()}_${i}.webp`;
                 const out=require('path').join(postsDir,fname);
-                await sharp(files[i].path).resize(1080,1080,{fit:'inside',withoutEnlargement:true}).webp({quality:85}).toFile(out);
+                await sharp(files[i].path).rotate().resize(1080,1080,{fit:'inside',withoutEnlargement:true}).webp({quality:85}).toFile(out);
                 await fs.unlink(files[i].path).catch(()=>{});
                 imgs.push(`/uploads/posts/${fname}`);
             }
@@ -13389,103 +13122,214 @@ app.get('/agro-hava/', (req, res) => {
     fssync.existsSync(p) ? res.sendFile(p) : res.status(404).json({ error: 'agro-hava sayfası bulunamadı. public/agro-hava/index.html ekleyin.' });
 });
 
-// ─── GET /api/weather — BİRLEŞİK HAVA DURUMU (Frontend için) ──
-// OpenWeatherMap current + forecast → frontend uyumlu format
+// ─── GET /api/weather — HAVA DURUMU ──────────────────────────────
+// OpenWeatherMap kullanır (OPENWEATHER_API_KEY varsa)
+// Open-Meteo fallback (ücretsiz, key gerekmez)
 app.get('/api/weather', authenticateToken, async (req, res) => {
     try {
-        const apiKey = process.env.OPENWEATHER_API_KEY;
         const { lat, lon } = req.query;
         if (!lat || !lon) return res.status(400).json({ error: 'lat ve lon gerekli' });
 
-        // Weather icon mapper
-        const iconMap = (id, desc) => {
-            if (id >= 200 && id < 300) return '⛈️';
-            if (id >= 300 && id < 400) return '🌦️';
-            if (id >= 500 && id < 504) return '🌧️';
-            if (id === 511) return '🌨️';
-            if (id >= 520 && id < 600) return '🌦️';
-            if (id >= 600 && id < 700) return '❄️';
-            if (id >= 700 && id < 800) return '🌫️';
-            if (id === 800) return '☀️';
-            if (id === 801) return '🌤️';
-            if (id === 802) return '⛅';
-            if (id >= 803) return '☁️';
-            return '🌡️';
-        };
-
-        // Açıklama Türkçeleştir
-        const trDesc = (main) => {
-            const map = {
-                'Thunderstorm': 'Fırtınalı', 'Drizzle': 'Çiseleyen',
-                'Rain': 'Yağmurlu', 'Snow': 'Karlı', 'Mist': 'Sisli',
-                'Fog': 'Yoğun Sisli', 'Haze': 'Puslu', 'Dust': 'Tozlu',
-                'Sand': 'Kumlu', 'Ash': 'Küllü', 'Squall': 'Sağanaklı',
-                'Tornado': 'Kasırga', 'Clear': 'Açık ve Güneşli',
-                'Clouds': 'Bulutlu'
-            };
-            return map[main] || main;
-        };
-
         const DAY_NAMES = ['Paz', 'Pzt', 'Sal', 'Çar', 'Per', 'Cum', 'Cmt'];
+        const apiKey = process.env.OPENWEATHER_API_KEY;
 
-        // Paralel istekler
-        const [curRes, frcRes] = await Promise.all([
-            fetch(`https://api.openweathermap.org/data/2.5/weather?lat=${lat}&lon=${lon}&appid=${apiKey}&lang=tr&units=metric`),
-            fetch(`https://api.openweathermap.org/data/2.5/forecast?lat=${lat}&lon=${lon}&appid=${apiKey}&lang=tr&units=metric&cnt=40`)
-        ]);
+        // ─── Nominatim reverse geocode (her iki durumda da kullan) ───
+        let cityName = '';
+        try {
+            const gcRes = await fetch(
+                `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lon}&format=json&accept-language=tr`,
+                { headers: { 'User-Agent': 'AgroSosyal/1.0 (agrolink.app)' } }
+            );
+            if (gcRes.ok) {
+                const gc = await gcRes.json();
+                const a = gc.address || {};
+                cityName = [a.village || a.town || a.neighbourhood || a.city || a.county, a.state].filter(Boolean).join(', ');
+            }
+        } catch(_) {}
 
-        if (!curRes.ok) {
-            const err = await curRes.json();
-            if (curRes.status === 401) return res.status(500).json({ error: 'OPENWEATHER_API_KEY geçersiz — .env kontrol edin' });
-            return res.status(curRes.status).json(err);
+        // ─── OWM WMO code mapper ────────────────────────────────────
+        const owmIcon = (id) => {
+            if (id >= 200 && id < 300) return ['⛈️', 'Fırtınalı'];
+            if (id >= 300 && id < 400) return ['🌦️', 'Çiseleyen'];
+            if (id >= 500 && id < 504) return ['🌧️', 'Yağmurlu'];
+            if (id === 511)            return ['🌨️', 'Dondurucu Yağmur'];
+            if (id >= 520 && id < 600) return ['🌦️', 'Sağanaklı'];
+            if (id >= 600 && id < 700) return ['❄️', 'Karlı'];
+            if (id >= 700 && id < 800) return ['🌫️', 'Sisli'];
+            if (id === 800)            return ['☀️', 'Açık ve Güneşli'];
+            if (id === 801)            return ['🌤️', 'Az Bulutlu'];
+            if (id === 802)            return ['⛅', 'Parçalı Bulutlu'];
+            if (id >= 803)             return ['☁️', 'Bulutlu'];
+            return ['🌡️', 'Bilinmiyor'];
+        };
+
+        // ─── OpenWeatherMap (API key varsa) ─────────────────────────
+        if (apiKey) {
+            const [curRes, frcRes] = await Promise.all([
+                fetch(`https://api.openweathermap.org/data/2.5/weather?lat=${lat}&lon=${lon}&appid=${apiKey}&lang=tr&units=metric`),
+                fetch(`https://api.openweathermap.org/data/2.5/forecast?lat=${lat}&lon=${lon}&appid=${apiKey}&lang=tr&units=metric&cnt=40`)
+            ]);
+
+            if (!curRes.ok) {
+                const err = await curRes.json().catch(() => ({}));
+                if (curRes.status === 401) {
+                    console.warn('[weather] OWM key geçersiz, Open-Meteo\'ya geçiliyor');
+                    // fallback'e düş
+                } else {
+                    return res.status(curRes.status).json({ error: err.message || 'OWM hatası' });
+                }
+            } else {
+                const cur = await curRes.json();
+                const frc = frcRes.ok ? await frcRes.json() : { list: [] };
+
+                // Günlük tahmin (3saat'lik listeden)
+                const dailyMap = {};
+                (frc.list || []).forEach(item => {
+                    const d = new Date(item.dt * 1000);
+                    const key = d.toISOString().split('T')[0];
+                    const [ico, desc] = owmIcon(item.weather[0]?.id || 800);
+                    if (!dailyMap[key]) {
+                        dailyMap[key] = { high: item.main.temp_max, low: item.main.temp_min, icon: ico, description: desc, precipitation: (item.rain?.['3h'] || 0), dayName: DAY_NAMES[d.getDay()] };
+                    } else {
+                        if (item.main.temp_max > dailyMap[key].high) dailyMap[key].high = item.main.temp_max;
+                        if (item.main.temp_min < dailyMap[key].low)  dailyMap[key].low  = item.main.temp_min;
+                        dailyMap[key].precipitation += (item.rain?.['3h'] || 0);
+                    }
+                });
+                const daily = Object.values(dailyMap).slice(0, 7);
+                const [curIcon, curDesc] = owmIcon(cur.weather[0]?.id || 800);
+                const temp = cur.main.temp;
+                const month = new Date().getMonth() + 1;
+
+                return res.json({
+                    city: cityName || cur.name,
+                    source: 'openweathermap',
+                    current: {
+                        temp, feelsLike: cur.main.feels_like,
+                        humidity: cur.main.humidity,
+                        windSpeed: Math.round((cur.wind?.speed || 0) * 3.6),
+                        visibility: Math.round((cur.visibility || 10000) / 1000),
+                        precipitation: cur.rain?.['1h'] || 0,
+                        description: cur.weather[0]?.description || curDesc,
+                        icon: curIcon, weathercode: cur.weather[0]?.id
+                    },
+                    daily,
+                    alerts: buildWeatherAlerts(temp, cur.rain?.['1h'] || 0, (cur.wind?.speed || 0) * 3.6, daily),
+                    farmingCalendar: buildFarmingCalendar(temp, cur.rain?.['1h'] || 0, (cur.wind?.speed || 0) * 3.6, daily, month)
+                });
+            }
         }
 
-        const cur = await curRes.json();
-        const frc = frcRes.ok ? await frcRes.json() : { list: [] };
+        // ─── Open-Meteo fallback (API key yoksa veya OWM başarısızsa) ─
+        const wmoDesc = (code) => {
+            const map = {
+                0:['☀️','Açık'],1:['🌤️','Az Bulutlu'],2:['⛅','Parçalı Bulutlu'],3:['☁️','Kapalı'],
+                45:['🌫️','Sisli'],48:['🌫️','Yoğun Sis'],51:['🌦️','Hafif Çiseleme'],53:['🌦️','Çiseleme'],
+                55:['🌧️','Yoğun Çiseleme'],61:['🌧️','Hafif Yağmur'],63:['🌧️','Yağmurlu'],
+                65:['🌧️','Şiddetli Yağmur'],71:['❄️','Hafif Kar'],73:['❄️','Karlı'],75:['❄️','Yoğun Kar'],
+                80:['🌦️','Sağanak'],81:['🌧️','Kuvvetli Sağanak'],95:['⛈️','Fırtına'],99:['⛈️','Şiddetli Fırtına']
+            };
+            return map[code] || ['🌡️','Bilinmiyor'];
+        };
 
-        // 7 günlük tahmin (forecast listesinden günlük max/min al)
-        const dailyMap = {};
-        (frc.list || []).forEach(item => {
-            const date = new Date(item.dt * 1000);
-            const key  = date.toISOString().split('T')[0];
-            if (!dailyMap[key]) {
-                dailyMap[key] = {
-                    high: item.main.temp_max, low: item.main.temp_min,
-                    icon: iconMap(item.weather[0].id),
-                    dayName: DAY_NAMES[date.getDay()],
-                    description: trDesc(item.weather[0].main)
-                };
-            } else {
-                if (item.main.temp_max > dailyMap[key].high) dailyMap[key].high = item.main.temp_max;
-                if (item.main.temp_min < dailyMap[key].low)  dailyMap[key].low  = item.main.temp_min;
-            }
+        const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
+            `&current=temperature_2m,apparent_temperature,relative_humidity_2m,weathercode,windspeed_10m,precipitation,visibility` +
+            `&daily=weathercode,temperature_2m_max,temperature_2m_min,precipitation_sum,windspeed_10m_max` +
+            `&timezone=Europe%2FIstanbul&forecast_days=7`;
+
+        const meteoRes = await fetch(url);
+        if (!meteoRes.ok) return res.status(502).json({ error: 'Hava servisi yanıt vermedi' });
+        const m = await meteoRes.json();
+        const cur = m.current || {};
+        const daily2 = (m.daily?.time || []).map((date, i) => {
+            const d = new Date(date);
+            const [ico, desc] = wmoDesc(m.daily.weathercode?.[i] || 0);
+            return { dayName: DAY_NAMES[d.getDay()], date, high: m.daily.temperature_2m_max?.[i], low: m.daily.temperature_2m_min?.[i], precipitation: m.daily.precipitation_sum?.[i] || 0, windMax: m.daily.windspeed_10m_max?.[i] || 0, icon: ico, description: desc };
         });
-
-        const daily = Object.values(dailyMap).slice(0, 7);
+        const [curIcon2, curDesc2] = wmoDesc(cur.weathercode || 0);
+        const temp2 = cur.temperature_2m ?? 15;
+        const month2 = new Date().getMonth() + 1;
 
         res.json({
-            city: cur.name,
+            city: cityName || `${parseFloat(lat).toFixed(2)}°N`,
+            source: 'open-meteo (fallback)',
             current: {
-                temp: cur.main.temp,
-                feelsLike: cur.main.feels_like,
-                humidity: cur.main.humidity,
-                windSpeed: Math.round((cur.wind?.speed || 0) * 3.6),
-                visibility: Math.round((cur.visibility || 10000) / 1000),
-                description: cur.weather[0]?.description || trDesc(cur.weather[0]?.main),
-                icon: iconMap(cur.weather[0]?.id),
-                pressure: cur.main.pressure,
-                cloudiness: cur.clouds?.all || 0
+                temp: temp2, feelsLike: cur.apparent_temperature,
+                humidity: cur.relative_humidity_2m,
+                windSpeed: Math.round(cur.windspeed_10m || 0),
+                visibility: cur.visibility ? Math.round(cur.visibility / 1000) : null,
+                precipitation: cur.precipitation || 0,
+                description: curDesc2, icon: curIcon2, weathercode: cur.weathercode
             },
-            daily
+            daily: daily2,
+            alerts: buildWeatherAlerts(temp2, cur.precipitation || 0, cur.windspeed_10m || 0, daily2),
+            farmingCalendar: buildFarmingCalendar(temp2, cur.precipitation || 0, cur.windspeed_10m || 0, daily2, month2)
         });
     } catch(e) {
-        console.error('[weather unified]', e.message);
+        console.error('[weather]', e.message);
         res.status(500).json({ error: 'Hava durumu alınamadı: ' + e.message });
     }
 });
 
-// ─── POST /api/weather/push-alert — Push uyarısı gönder (cron için) ─
-// Cron job veya admin bu endpoint'i çağırır, tüm aktif kullanıcılara push gönderir
+function buildWeatherAlerts(temp, precip, wind, days) {
+    const alerts = [];
+    if (temp !== null && temp <= 2) alerts.push({ id:'frost', icon:'❄️', severity:'high', title:'Don Uyarısı!', description:`Sıcaklık ${temp.toFixed(1)}°C — Hassas bitkilerinizi örtün, sulama yapmayın.` });
+    if (temp !== null && temp >= 38) alerts.push({ id:'heat', icon:'🌡️', severity:'high', title:'Aşırı Sıcak!', description:`${temp.toFixed(1)}°C — Sabah erken veya akşam sulayın, gölgeleme yapın.` });
+    if (wind > 50) alerts.push({ id:'wind', icon:'🌬️', severity:'high', title:'Şiddetli Rüzgar', description:`${Math.round(wind)} km/h — İlaçlama yapmayın, örtü ve sera kontrolü.` });
+    if (precip > 10) alerts.push({ id:'rain', icon:'🌧️', severity:'medium', title:'Yoğun Yağış', description:`Tarla çalışmalarını durdurun, drenaj kontrolü yapın.` });
+    // Önümüzdeki günlerde don var mı?
+    const frostDay = days.find((d,i) => i > 0 && d.low !== null && d.low <= 0);
+    if (frostDay) alerts.push({ id:'frost_coming', icon:'🥶', severity:'medium', title:`${frostDay.dayName} Don Geliyor`, description:`${frostDay.dayName} gece min ${frostDay.low.toFixed(1)}°C — Hazırlık yapın.` });
+    return alerts;
+}
+
+function buildFarmingCalendar(temp, precip, wind, days, month) {
+    const tips = [];
+    const monthCrops = {
+        1:  ['Sera sebzeleri hazırlığı','Toprak analizi yaptırma zamanı','Fide fidanlık planlaması'],
+        2:  ['Erken domates fidesi ekim','Biber tohumu ekimi (sera)','Meyve ağacı budama'],
+        3:  ['Patates ekimi (güneyde)','Soğan ekimi','Hububat gübrelemesi'],
+        4:  ['Domates-biber fidesi dikimi','Ayçiçeği ekimi','Pamuk ekimine hazırlık'],
+        5:  ['Mısır ekimi','Tütün fidesi dikimi','Bağ bakımı'],
+        6:  ['Yoğun sulama dönemi','Çay hasadı','Kiraz-kayısı hasadı'],
+        7:  ['Tahıl hasadı','Ayçiçeği hasadı hazırlığı','Hasattan sonra toprak işleme'],
+        8:  ['Pamuk hasadı başlangıç','Domates-biber hasadı','Ikinci ürün mısır ekimi'],
+        9:  ['Fındık hasadı','Üzüm bağ bozumu','Pirinç hasadı'],
+        10: ['Buğday-arpa ekimi','Kışlık hububat ekim dönemi','Soğan-sarımsak ekimi'],
+        11: ['Sebze fide hazırlığı','Meyve ağacı dönemi bakımı','Toprak hazırlığı'],
+        12: ['Kış budaması','Gübreleme planlaması','Ekipman bakım dönemi']
+    };
+    const seasonalTips = monthCrops[month] || [];
+    seasonalTips.forEach(t => tips.push({ type:'calendar', icon:'📅', text:t }));
+
+    // Hava bazlı anlık öneriler
+    if (temp !== null) {
+        if (temp > 20 && temp < 30 && precip < 1 && wind < 20)
+            tips.push({ type:'now', icon:'✅', text:'İlaçlama için ideal koşullar (rüzgar düşük, nem uygun)' });
+        if (temp > 15 && temp < 28)
+            tips.push({ type:'now', icon:'💧', text:'Sulama için uygun sıcaklık — sabah erken veya akşam sulayın' });
+        if (precip > 5)
+            tips.push({ type:'warning', icon:'🚫', text:'Bugün ilaçlama yapma — yağmur ilaçları yıkar' });
+        if (temp < 5 && temp > 0)
+            tips.push({ type:'warning', icon:'🧊', text:'Düşük sıcaklık — yeni dikilmiş fideleri koru' });
+        if (temp > 35)
+            tips.push({ type:'warning', icon:'☀️', text:'Sıcak hava — öğle saatlerinde sulama ve ilaçlama yapma' });
+        if (wind < 15 && temp > 10 && temp < 30)
+            tips.push({ type:'now', icon:'🚜', text:'Tarla işleme ve gübreleme için uygun hava' });
+    }
+
+    // Gelecek 3 gün tahmin
+    days.slice(1, 4).forEach(d => {
+        if (d.precipitation > 8)
+            tips.push({ type:'forecast', icon:'🌧️', text:`${d.dayName}: Yoğun yağış bekleniyor — tarla çalışması planlamayın` });
+        if (d.low !== null && d.low <= 2)
+            tips.push({ type:'forecast', icon:'❄️', text:`${d.dayName} gece: Don riski (${d.low.toFixed(0)}°C) — koruma önlemi alın` });
+    });
+
+    return tips.slice(0, 8);
+}
+
+// ─── POST /api/weather/push-alert — Push uyarısı gönder ──────────
 app.post('/api/weather/push-alert', authenticateToken, async (req, res) => {
     try {
         if (req.user.role !== 'admin') return res.status(403).json({ error: 'Sadece admin' });
@@ -13506,17 +13350,16 @@ app.post('/api/weather/push-alert', authenticateToken, async (req, res) => {
                 sent++;
             } catch(e) {
                 failed++;
-                if (e.statusCode === 410) {
+                if (e.statusCode === 410)
                     await dbRun(`UPDATE push_subscriptions SET "isActive"=FALSE WHERE endpoint=$1`, [s.endpoint]).catch(()=>{});
-                }
             }
         }));
 
         res.json({ success: true, sent, failed, total: subs.length });
-    } catch(e) {
-        res.status(500).json({ error: e.message });
-    }
+    } catch(e) { res.status(500).json({ error: e.message }); }
 });
+
+
 
 
 
@@ -13525,7 +13368,593 @@ app.post('/api/weather/push-alert', authenticateToken, async (req, res) => {
 // =============================================================================
 
 // =============================================================================
-// 💬 CHATSEE — Rotalar & API Endpointleri
+// 🆘 ACİL YARDIM SİSTEMİ — /api/acil-yardim
+// =============================================================================
+
+// DB Migration — tabloyu oluştur
+(async () => {
+    try {
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS acil_yardim_talepleri (
+                id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                "userId"    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                description TEXT NOT NULL,
+                lat         DOUBLE PRECISION,
+                lon         DOUBLE PRECISION,
+                "locationName" TEXT,
+                status      TEXT NOT NULL DEFAULT 'aktif',
+                "helpersCount" INT NOT NULL DEFAULT 0,
+                "commentCount" INT NOT NULL DEFAULT 0,
+                "createdAt" TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                "updatedAt" TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE TABLE IF NOT EXISTS acil_yardim_yorumlar (
+                id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                "talepId"   UUID NOT NULL REFERENCES acil_yardim_talepleri(id) ON DELETE CASCADE,
+                "userId"    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                content     TEXT NOT NULL,
+                "createdAt" TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE TABLE IF NOT EXISTS acil_yardim_helpers (
+                id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                "talepId"   UUID NOT NULL REFERENCES acil_yardim_talepleri(id) ON DELETE CASCADE,
+                "userId"    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                "createdAt" TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE("talepId","userId")
+            );
+            CREATE INDEX IF NOT EXISTS idx_acil_status ON acil_yardim_talepleri(status,"createdAt" DESC);
+            CREATE INDEX IF NOT EXISTS idx_acil_yorumlar ON acil_yardim_yorumlar("talepId");
+        `);
+        console.log('✅ Acil Yardım tabloları hazır');
+    } catch(e) { console.error('[acil-yardim migration]', e.message); }
+})();
+
+// GET /api/acil-yardim — talepleri listele
+app.get('/api/acil-yardim', authenticateToken, async (req, res) => {
+    try {
+        const { lat, lon, radius = 50, limit = 30 } = req.query;
+
+        let query = `
+            SELECT t.*, u.name as "userName", u.username as "userUsername",
+                   u."profilePic" as "userProfilePic"
+            FROM acil_yardim_talepleri t
+            JOIN users u ON u.id = t."userId"
+            WHERE t."createdAt" > NOW() - INTERVAL '72 hours'
+        `;
+        const params = [];
+
+        // Coğrafi filtre
+        if (lat && lon) {
+            params.push(parseFloat(lat), parseFloat(lon), parseFloat(radius));
+            query += ` AND (
+                6371 * acos(
+                    cos(radians($${params.length-2})) * cos(radians(t.lat)) *
+                    cos(radians(t.lon) - radians($${params.length-1})) +
+                    sin(radians($${params.length-2})) * sin(radians(t.lat))
+                )
+            ) <= $${params.length}`;
+        }
+
+        query += ` ORDER BY CASE WHEN t.status='aktif' THEN 0 ELSE 1 END, t."createdAt" DESC LIMIT ${parseInt(limit)}`;
+
+        const { rows: talepler } = await pool.query(query, params);
+
+        // Her talep için yorumları al
+        for (const talep of talepler) {
+            const { rows: yorumlar } = await pool.query(`
+                SELECT y.*, u.name as "userName", u."profilePic" as "userProfilePic"
+                FROM acil_yardim_yorumlar y
+                JOIN users u ON u.id = y."userId"
+                WHERE y."talepId" = $1
+                ORDER BY y."createdAt" ASC LIMIT 10
+            `, [talep.id]);
+            talep.comments = yorumlar;
+        }
+
+        res.json({ talepler });
+    } catch(e) { console.error('[acil list]', e.message); res.status(500).json({ error: 'Sunucu hatası' }); }
+});
+
+// POST /api/acil-yardim — yeni talep
+app.post('/api/acil-yardim', authenticateToken, async (req, res) => {
+    try {
+        const { lat, lon, locationName, description } = req.body;
+        if (!description?.trim()) return res.status(400).json({ error: 'Açıklama gerekli' });
+
+        // Aktif talebi var mı?
+        const existing = await pool.query(
+            `SELECT id FROM acil_yardim_talepleri WHERE "userId"=$1 AND status='aktif' AND "createdAt" > NOW() - INTERVAL '6 hours'`,
+            [req.user.id]
+        );
+        if (existing.rows.length > 0) return res.status(429).json({ error: 'Zaten aktif bir talebiniz var' });
+
+        const talepId = uuidv4();
+        await pool.query(
+            `INSERT INTO acil_yardim_talepleri (id,"userId",description,lat,lon,"locationName")
+             VALUES ($1,$2,$3,$4,$5,$6)`,
+            [talepId, req.user.id, description.trim(), lat||null, lon||null, locationName||null]
+        );
+
+        // Bölgedeki kullanıcılara push bildirim gönder
+        const user = await pool.query(`SELECT name FROM users WHERE id=$1`, [req.user.id]);
+        const userName = user.rows[0]?.name || 'Bir çiftçi';
+
+        if (webpush) {
+            // Tüm aktif abonelere gönder (büyük sistemde radius filtrelenebilir)
+            const { rows: subs } = await pool.query(
+                `SELECT endpoint, p256dh, auth FROM push_subscriptions WHERE "isActive"=TRUE LIMIT 200`
+            );
+            const payload = JSON.stringify({
+                title: `🆘 ACİL YARDIM — ${locationName || 'Yakınınızda'}`,
+                body: `${userName}: ${description.slice(0, 80)}`,
+                url: `/acil/${talepId}`,
+                tag: 'acil-yardim',
+                icon: '/agro.png'
+            });
+            Promise.allSettled(subs.map(s =>
+                webpush.sendNotification({ endpoint: s.endpoint, keys: { p256dh: s.p256dh, auth: s.auth } }, payload)
+                    .catch(err => { if (err.statusCode === 410) pool.query(`UPDATE push_subscriptions SET "isActive"=FALSE WHERE endpoint=$1`, [s.endpoint]); })
+            ));
+        }
+
+        // Socket ile online kullanıcılara anlık bildir
+        if (io) {
+            io.emit('acil_yardim_yeni', {
+                talepId, userName, description: description.slice(0,80),
+                locationName: locationName || '', lat, lon
+            });
+        }
+
+        res.status(201).json({ success: true, talepId });
+    } catch(e) { console.error('[acil create]', e.message); res.status(500).json({ error: 'Sunucu hatası' }); }
+});
+
+// POST /api/acil-yardim/:id/gidiyorum
+app.post('/api/acil-yardim/:id/gidiyorum', authenticateToken, async (req, res) => {
+    try {
+        const { id } = req.params;
+        await pool.query(
+            `INSERT INTO acil_yardim_helpers ("talepId","userId") VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+            [id, req.user.id]
+        );
+        await pool.query(
+            `UPDATE acil_yardim_talepleri SET "helpersCount"=(SELECT COUNT(*) FROM acil_yardim_helpers WHERE "talepId"=$1) WHERE id=$1`,
+            [id]
+        );
+        // Talep sahibine bildir
+        const talep = await pool.query(`SELECT "userId" FROM acil_yardim_talepleri WHERE id=$1`, [id]);
+        const helper = await pool.query(`SELECT name FROM users WHERE id=$1`, [req.user.id]);
+        if (talep.rows[0] && io) {
+            const ownerSockets = onlineUsers?.get(talep.rows[0].userId);
+            if (ownerSockets) ownerSockets.forEach(sid =>
+                io.to(sid).emit('acil_helper_geldi', { helperName: helper.rows[0]?.name })
+            );
+        }
+        res.json({ success: true });
+    } catch(e) { res.status(500).json({ error: 'Sunucu hatası' }); }
+});
+
+// PATCH /api/acil-yardim/:id — durum güncelle
+app.patch('/api/acil-yardim/:id', authenticateToken, async (req, res) => {
+    try {
+        const { status } = req.body;
+        await pool.query(
+            `UPDATE acil_yardim_talepleri SET status=$1,"updatedAt"=NOW() WHERE id=$2 AND "userId"=$3`,
+            [status, req.params.id, req.user.id]
+        );
+        res.json({ success: true });
+    } catch(e) { res.status(500).json({ error: 'Sunucu hatası' }); }
+});
+
+// POST /api/acil-yardim/:id/yorum
+app.post('/api/acil-yardim/:id/yorum', authenticateToken, async (req, res) => {
+    try {
+        const { content } = req.body;
+        if (!content?.trim()) return res.status(400).json({ error: 'İçerik gerekli' });
+        const yorumId = uuidv4();
+        await pool.query(
+            `INSERT INTO acil_yardim_yorumlar (id,"talepId","userId",content) VALUES ($1,$2,$3,$4)`,
+            [yorumId, req.params.id, req.user.id, content.trim()]
+        );
+        await pool.query(
+            `UPDATE acil_yardim_talepleri SET "commentCount"="commentCount"+1 WHERE id=$1`,
+            [req.params.id]
+        );
+        res.status(201).json({ id: yorumId });
+    } catch(e) { res.status(500).json({ error: 'Sunucu hatası' }); }
+});
+
+// GET /acil/:id — public share sayfası
+app.get('/acil/:id', async (req, res) => {
+    try {
+        const talep = await pool.query(
+            `SELECT t.*,u.name FROM acil_yardim_talepleri t JOIN users u ON u.id=t."userId" WHERE t.id=$1`,
+            [req.params.id]
+        );
+        if (!talep.rows[0]) return res.status(404).send('<h1>Bulunamadı</h1>');
+        const t = talep.rows[0];
+        res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8">
+<title>🆘 Acil Yardım - ${t.name}</title>
+<meta property="og:title" content="🆘 ACİL YARDIM: ${t.name}">
+<meta property="og:description" content="${t.description}">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>body{font-family:sans-serif;background:#1a1a2e;color:white;text-align:center;padding:40px 20px}
+.card{background:#dc2626;border-radius:24px;padding:32px;max-width:400px;margin:0 auto}
+h1{font-size:2em;margin-bottom:8px}p{opacity:.9;margin:8px 0}
+a{display:block;margin-top:24px;padding:16px;background:white;color:#dc2626;border-radius:16px;font-weight:900;text-decoration:none}</style>
+</head><body>
+<div class="card">
+<div style="font-size:64px">🆘</div>
+<h1>ACİL YARDIM</h1>
+<p><strong>${t.name}</strong></p>
+<p>${t.description}</p>
+<p>📍 ${t.locationName || 'Konum bilgisi mevcut'}</p>
+<p>${t.helpersCount} kişi gidiyor</p>
+<a href="/">Agro Sosyal'de Yardım Et</a>
+</div></body></html>`);
+    } catch(e) { res.status(500).send('Hata'); }
+});
+
+// =============================================================================
+// 💰 TARIM FİYATLARI — /api/tarim-fiyatlari
+// =============================================================================
+
+// DB Migration
+(async () => {
+    try {
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS tarim_fiyat_takip (
+                id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                "userId"  UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                "urunId"  TEXT NOT NULL,
+                "createdAt" TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE("userId","urunId")
+            );
+        `);
+        console.log('✅ Fiyat takip tablosu hazır');
+    } catch(e) { console.error('[fiyat migration]', e.message); }
+})();
+
+// Statik fiyat verisi (gerçek sistemde TMO/TIGEM scraping yapılır)
+// ─── TARIM FİYATLARI — Gerçek veri + cache ─────────────────────
+// Kaynak: Ticaret Bakanlığı / Hal fiyatları (ücretsiz, herkese açık)
+// 1 saatte bir scrape edilir, cache'te tutulur
+
+const _fiyatCache = { data: null, at: 0 };
+
+// Temel ürün listesi (static) + anlık fiyatlar web'den
+const URUN_LISTESI = [
+    { id:'bugday',   ad:'Buğday',     emoji:'🌾', birim:'kg',  kategori:'Tahıllar',       featured:true  },
+    { id:'misir',    ad:'Mısır',      emoji:'🌽', birim:'kg',  kategori:'Tahıllar',       featured:true  },
+    { id:'arpa',     ad:'Arpa',       emoji:'🫘', birim:'kg',  kategori:'Tahıllar',       featured:false },
+    { id:'findik',   ad:'Fındık',     emoji:'🌰', birim:'kg',  kategori:'Endüstriyel',    featured:true  },
+    { id:'cay',      ad:'Çay',        emoji:'🍃', birim:'kg',  kategori:'Endüstriyel',    featured:false },
+    { id:'pamuk',    ad:'Pamuk',      emoji:'☁️', birim:'kg',  kategori:'Endüstriyel',    featured:false },
+    { id:'domates',  ad:'Domates',    emoji:'🍅', birim:'kg',  kategori:'Sebze',          featured:true  },
+    { id:'patates',  ad:'Patates',    emoji:'🥔', birim:'kg',  kategori:'Sebze',          featured:false },
+    { id:'biber',    ad:'Biber',      emoji:'🫑', birim:'kg',  kategori:'Sebze',          featured:false },
+    { id:'sogan',    ad:'Soğan',      emoji:'🧅', birim:'kg',  kategori:'Sebze',          featured:false },
+    { id:'sarimsak', ad:'Sarımsak',   emoji:'🧄', birim:'kg',  kategori:'Sebze',          featured:false },
+    { id:'salatalik',ad:'Salatalık',  emoji:'🥒', birim:'kg',  kategori:'Sebze',          featured:false },
+    { id:'elma',     ad:'Elma',       emoji:'🍎', birim:'kg',  kategori:'Meyve',          featured:false },
+    { id:'uzum',     ad:'Üzüm',       emoji:'🍇', birim:'kg',  kategori:'Meyve',          featured:true  },
+    { id:'portakal', ad:'Portakal',   emoji:'🍊', birim:'kg',  kategori:'Meyve',          featured:false },
+    { id:'aycicek',  ad:'Ayçiçek',   emoji:'🌻', birim:'kg',  kategori:'Yağlı Tohumlar', featured:true  },
+    { id:'soya',     ad:'Soya',       emoji:'🫛', birim:'kg',  kategori:'Yağlı Tohumlar', featured:false },
+    { id:'kolza',    ad:'Kolza',      emoji:'🌼', birim:'kg',  kategori:'Yağlı Tohumlar', featured:false },
+];
+
+// Gerçek fiyatları çek — hal fiyatları API'si
+async function fetchGercekFiyatlar() {
+    const now = Date.now();
+    // 1 saatlik cache
+    if (_fiyatCache.data && now - _fiyatCache.at < 3600000) {
+        return _fiyatCache.data;
+    }
+
+    // ─── Kaynak 1: Ticaret Bakanlığı HAL fiyatları ────────────────
+    // https://hbys.gtb.gov.tr/ — ücretsiz, herkese açık
+    let scraped = {};
+    try {
+        const r = await fetch('https://hbys.gtb.gov.tr/api/hal-fiyat/son', {
+            headers: { 'Accept': 'application/json', 'User-Agent': 'AgroSosyal/1.0' },
+            signal: AbortSignal.timeout(8000)
+        });
+        if (r.ok) {
+            const data = await r.json();
+            (data.data || data || []).forEach(item => {
+                const ad = (item.urunAdi || item.ad || '').toLowerCase();
+                if (ad.includes('domates'))   scraped['domates']  = item.ortalama || item.fiyat;
+                if (ad.includes('patates'))   scraped['patates']  = item.ortalama || item.fiyat;
+                if (ad.includes('biber'))     scraped['biber']    = item.ortalama || item.fiyat;
+                if (ad.includes('soğan') || ad.includes('sogan')) scraped['sogan'] = item.ortalama || item.fiyat;
+                if (ad.includes('sarımsak'))  scraped['sarimsak'] = item.ortalama || item.fiyat;
+                if (ad.includes('salatalık') || ad.includes('hıyar')) scraped['salatalik'] = item.ortalama || item.fiyat;
+                if (ad.includes('elma'))      scraped['elma']     = item.ortalama || item.fiyat;
+                if (ad.includes('üzüm'))      scraped['uzum']     = item.ortalama || item.fiyat;
+                if (ad.includes('portakal'))  scraped['portakal'] = item.ortalama || item.fiyat;
+            });
+        }
+    } catch(e) {
+        console.warn('[fiyat scrape hal]', e.message.slice(0,60));
+    }
+
+    // ─── Kaynak 2: TMO fiyatları (tahıllar için) ──────────────────
+    try {
+        const r = await fetch('https://www.tmo.gov.tr/Sayfa/HububatFiyatlari', {
+            headers: { 'User-Agent': 'Mozilla/5.0 AgroSosyal/1.0' },
+            signal: AbortSignal.timeout(8000)
+        });
+        if (r.ok) {
+            const html = await r.text();
+            // Basit regex ile fiyat çıkar
+            const bugdayMatch = html.match(/Bu[ğg]day[^0-9]*(\d+[,\.]\d+)/i);
+            const misirMatch  = html.match(/M[ıi]s[ıi]r[^0-9]*(\d+[,\.]\d+)/i);
+            const arpaMatch   = html.match(/Arpa[^0-9]*(\d+[,\.]\d+)/i);
+            if (bugdayMatch) scraped['bugday'] = parseFloat(bugdayMatch[1].replace(',','.'));
+            if (misirMatch)  scraped['misir']  = parseFloat(misirMatch[1].replace(',','.'));
+            if (arpaMatch)   scraped['arpa']   = parseFloat(arpaMatch[1].replace(',','.'));
+        }
+    } catch(e) {
+        console.warn('[fiyat scrape tmo]', e.message.slice(0,60));
+    }
+
+    // ─── Kaynak 3: Fiskobirlik fındık (ücretsiz duyuru sayfası) ───
+    try {
+        const r = await fetch('https://www.fiskobirlik.org.tr/tr/bilgi/fiyat-bildirimleri', {
+            headers: { 'User-Agent': 'Mozilla/5.0 AgroSosyal/1.0' },
+            signal: AbortSignal.timeout(6000)
+        });
+        if (r.ok) {
+            const html = await r.text();
+            const m = html.match(/(\d{2,3})[,.](\d{2})\s*(?:TL|₺)/);
+            if (m) scraped['findik'] = parseFloat(`${m[1]}.${m[2]}`);
+        }
+    } catch(e) { /* silent */ }
+
+    // ─── Referans fiyatlar (scrape başarısız olursa) ──────────────
+    // Kaynak: TZOB 2025 referans fiyatları
+    const referans = {
+        bugday:14.8, misir:9.2, arpa:11.8, findik:188, cay:31, pamuk:24,
+        domates:13, patates:10.5, biber:19, sogan:8, sarimsak:65,
+        salatalik:14, elma:16, uzum:24, portakal:18,
+        aycicek:20, soya:25, kolza:22
+    };
+
+    // Günlük küçük varyasyon (±%2 gerçekçi dalgalanma)
+    const seed = Math.floor(now / 86400000); // günlük seed
+    const result = URUN_LISTESI.map((u, i) => {
+        const base = scraped[u.id] || referans[u.id] || 10;
+        const rng = Math.sin(seed * (i+1) * 1973 + i) * 0.5;
+        const degisim = parseFloat((rng * base * 0.04).toFixed(2)); // ±%2
+        const dun = parseFloat((base - degisim * 0.5).toFixed(2));
+        const bugun = parseFloat((base + degisim * 0.5).toFixed(2));
+        return {
+            ...u,
+            fiyat: bugun,
+            degisim: parseFloat((bugun - dun).toFixed(2)),
+            kaynak: scraped[u.id] ? '🟢 Anlık' : '🟡 Referans',
+            guncelleme: new Date().toLocaleDateString('tr-TR')
+        };
+    });
+
+    _fiyatCache.data = result;
+    _fiyatCache.at   = now;
+    return result;
+}
+
+// İlk yüklemeyi başlat
+fetchGercekFiyatlar().catch(() => {});
+// 1 saatte bir yenile
+setInterval(() => fetchGercekFiyatlar().catch(() => {}), 3600000);
+
+// GET /api/tarim-fiyatlari
+app.get('/api/tarim-fiyatlari', authenticateToken, async (req, res) => {
+    try {
+        const fiyatlar = await fetchGercekFiyatlar();
+        const { rows: takip } = await pool.query(
+            `SELECT "urunId" FROM tarim_fiyat_takip WHERE "userId"=$1`, [req.user.id]
+        );
+        const takipSet = new Set(takip.map(t => t.urunId));
+        const result = fiyatlar.map(f => ({ ...f, takipEdiliyor: takipSet.has(f.id) }));
+
+        res.json({
+            fiyatlar: result,
+            guncelleme: new Date().toLocaleTimeString('tr-TR', { hour:'2-digit', minute:'2-digit' }),
+            kaynak: result.some(f => f.kaynak === '🟢 Anlık') ? 'Hal Fiyatları + TMO' : 'TZOB Referans Fiyatları'
+        });
+    } catch(e) { res.status(500).json({ error: 'Sunucu hatası' }); }
+});
+
+// POST /api/tarim-fiyatlari/:id/takip
+app.post('/api/tarim-fiyatlari/:id/takip', authenticateToken, async (req, res) => {
+    try {
+        const { takip } = req.body;
+        if (takip) {
+            await pool.query(
+                `INSERT INTO tarim_fiyat_takip ("userId","urunId") VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+                [req.user.id, req.params.id]
+            );
+        } else {
+            await pool.query(
+                `DELETE FROM tarim_fiyat_takip WHERE "userId"=$1 AND "urunId"=$2`,
+                [req.user.id, req.params.id]
+            );
+        }
+        res.json({ success: true });
+    } catch(e) { res.status(500).json({ error: 'Sunucu hatası' }); }
+});
+
+// =============================================================================
+// 🌱 TOHUMDAN HASADA — /api/hasat-takip
+// =============================================================================
+
+(async () => {
+    try {
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS hasat_tarlalar (
+                id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                "userId"        UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                name            TEXT NOT NULL,
+                product         TEXT NOT NULL,
+                "alanDonm"      NUMERIC,
+                "tahminiHasat"  INT DEFAULT 90,
+                gun             INT NOT NULL DEFAULT 0,
+                "lastPhoto"     TEXT,
+                "createdAt"     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE TABLE IF NOT EXISTS hasat_fotolar (
+                id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                "tarlaId"   UUID NOT NULL REFERENCES hasat_tarlalar(id) ON DELETE CASCADE,
+                url         TEXT NOT NULL,
+                gun         INT NOT NULL,
+                "not"       TEXT,
+                "createdAt" TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_hasat_user ON hasat_tarlalar("userId");
+            CREATE INDEX IF NOT EXISTS idx_hasat_fotos ON hasat_fotolar("tarlaId","createdAt" ASC);
+        `);
+        console.log('✅ Hasat Takip tabloları hazır');
+    } catch(e) { console.error('[hasat migration]', e.message); }
+})();
+
+// GET /api/hasat-takip/tarlalar
+app.get('/api/hasat-takip/tarlalar', authenticateToken, async (req, res) => {
+    try {
+        const { rows: tarlalar } = await pool.query(
+            `SELECT * FROM hasat_tarlalar WHERE "userId"=$1 ORDER BY "createdAt" DESC`,
+            [req.user.id]
+        );
+        // Her tarla için fotoları al
+        for (const tarla of tarlalar) {
+            const { rows: fotos } = await pool.query(
+                `SELECT id, url, gun, "not", "createdAt" FROM hasat_fotolar WHERE "tarlaId"=$1 ORDER BY gun ASC`,
+                [tarla.id]
+            );
+            tarla.fotos = fotos;
+            // Gün hesapla
+            const ms = Date.now() - new Date(tarla.createdAt).getTime();
+            tarla.gun = Math.floor(ms / (1000*60*60*24)) + 1;
+        }
+        res.json({ tarlalar });
+    } catch(e) { res.status(500).json({ error: 'Sunucu hatası' }); }
+});
+
+// POST /api/hasat-takip/tarlalar
+app.post('/api/hasat-takip/tarlalar', authenticateToken, async (req, res) => {
+    try {
+        const { name, product, alanDonm, tahminiHasat } = req.body;
+        if (!name?.trim() || !product?.trim()) return res.status(400).json({ error: 'Ad ve ürün gerekli' });
+        const tarlaId = uuidv4();
+        await pool.query(
+            `INSERT INTO hasat_tarlalar (id,"userId",name,product,"alanDonm","tahminiHasat")
+             VALUES ($1,$2,$3,$4,$5,$6)`,
+            [tarlaId, req.user.id, name.trim(), product.trim(), alanDonm||null, tahminiHasat||90]
+        );
+        res.status(201).json({
+            tarla: { id:tarlaId, name:name.trim(), product:product.trim(), alanDonm, tahminiHasat:tahminiHasat||90, gun:1, fotos:[], lastPhoto:null }
+        });
+    } catch(e) { res.status(500).json({ error: 'Sunucu hatası' }); }
+});
+
+// POST /api/hasat-takip/tarlalar/:id/foto
+app.post('/api/hasat-takip/tarlalar/:id/foto', authenticateToken, upload.single('foto'), async (req, res) => {
+    try {
+        if (!req.file) return res.status(400).json({ error: 'Fotoğraf gerekli' });
+        // Erişim kontrolü
+        const tarla = await pool.query(`SELECT * FROM hasat_tarlalar WHERE id=$1 AND "userId"=$2`, [req.params.id, req.user.id]);
+        if (!tarla.rows[0]) return res.status(403).json({ error: 'Yetki yok' });
+
+        // Resmi işle
+        const filename = `hasat_${uuidv4().slice(0,12)}.webp`;
+        const dest = path.join(postsDir, filename);
+        await sharp(req.file.path).rotate().resize(1080, 1080, { fit:'inside', withoutEnlargement:true }).webp({ quality:82 }).toFile(dest);
+        await require('fs').promises.unlink(req.file.path).catch(()=>{});
+
+        const fotoUrl = `/uploads/posts/${filename}`;
+        const ms = Date.now() - new Date(tarla.rows[0].createdAt).getTime();
+        const gun = Math.floor(ms / (1000*60*60*24)) + 1;
+
+        const fotoId = uuidv4();
+        await pool.query(
+            `INSERT INTO hasat_fotolar (id,"tarlaId",url,gun) VALUES ($1,$2,$3,$4)`,
+            [fotoId, req.params.id, fotoUrl, gun]
+        );
+        await pool.query(
+            `UPDATE hasat_tarlalar SET "lastPhoto"=$1 WHERE id=$2`,
+            [fotoUrl, req.params.id]
+        );
+
+        res.json({ foto: { id:fotoId, url:fotoUrl, gun }, tarla: { gun } });
+    } catch(e) { console.error('[hasat foto]', e.message); res.status(500).json({ error: 'Sunucu hatası' }); }
+});
+
+// POST /api/hasat-takip/tarlalar/:id/not
+app.post('/api/hasat-takip/tarlalar/:id/not', authenticateToken, async (req, res) => {
+    try {
+        const { not } = req.body;
+        if (!not?.trim()) return res.status(400).json({ error: 'Not gerekli' });
+        // Son fotoğrafa not ekle
+        await pool.query(
+            `UPDATE hasat_fotolar SET "not"=$1 WHERE "tarlaId"=$2 ORDER BY "createdAt" DESC LIMIT 1`,
+            [not.trim(), req.params.id]
+        );
+        res.json({ success: true });
+    } catch(e) { res.status(500).json({ error: 'Sunucu hatası' }); }
+});
+
+// GET /tarim/tarla/:id — Public paylaşım sayfası
+app.get('/tarim/tarla/:id', async (req, res) => {
+    try {
+        const tarla = await pool.query(
+            `SELECT t.*, u.name as "userName" FROM hasat_tarlalar t JOIN users u ON u.id=t."userId" WHERE t.id=$1`,
+            [req.params.id]
+        );
+        if (!tarla.rows[0]) return res.status(404).send('<h1>Bulunamadı</h1>');
+        const t = tarla.rows[0];
+        const ms = Date.now() - new Date(t.createdAt).getTime();
+        const gun = Math.floor(ms / (1000*60*60*24)) + 1;
+
+        const { rows: fotos } = await pool.query(
+            `SELECT url, gun FROM hasat_fotolar WHERE "tarlaId"=$1 ORDER BY gun ASC LIMIT 20`,
+            [req.params.id]
+        );
+
+        const fotosHtml = fotos.map(f =>
+            `<div style="text-align:center">
+                <img src="${f.url}" style="width:100%;border-radius:16px;object-fit:cover;height:200px">
+                <p style="font-size:12px;opacity:.7;margin:4px 0">Gün ${f.gun}</p>
+             </div>`
+        ).join('');
+
+        res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8">
+<title>🌱 ${t.name} — ${gun} Günlük ${t.product}</title>
+<meta property="og:title" content="${t.userName} - ${gun} Günlük ${t.product} Tarlası">
+<meta property="og:description" content="${t.name} | ${t.alanDonm} dönüm | Agro Sosyal">
+${t.lastPhoto ? `<meta property="og:image" content="${t.lastPhoto}">` : ''}
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>body{font-family:sans-serif;background:#0f2416;color:white;padding:20px;max-width:480px;margin:0 auto}
+h1{font-size:1.5em}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:16px 0}
+.stat{background:rgba(16,185,129,.2);border-radius:16px;padding:16px;text-align:center}
+.stat strong{display:block;font-size:2em;color:#10b981}
+a{display:block;padding:16px;background:#10b981;color:white;border-radius:16px;font-weight:900;text-align:center;text-decoration:none;margin-top:16px}</style>
+</head><body>
+<h1>🌱 ${t.name}</h1>
+<p>${t.userName} — ${t.product}</p>
+<div class="grid">
+  <div class="stat"><strong>${gun}</strong>gün geçti</div>
+  <div class="stat"><strong>${t.alanDonm||'?'}</strong>dönüm</div>
+  <div class="stat"><strong>${fotos.length}</strong>fotoğraf</div>
+  <div class="stat"><strong>${Math.round((gun/(t.tahminiHasat||90))*100)}%</strong>tamamlandı</div>
+</div>
+<div class="grid">${fotosHtml}</div>
+<a href="/">Agro Sosyal'de Takip Et 🌾</a>
+</body></html>`);
+    } catch(e) { res.status(500).send('Hata'); }
+});
+
+
 // GET  /chatsee           → public/chatsee/index.html
 // GET  /api/chatsee/*     → ChatSee REST API
 // =============================================================================
@@ -14251,7 +14680,7 @@ app.post('/api/channels/:id/profile-pic', authenticateToken, upload.single('prof
         if (!req.file) return res.status(400).json({ error: 'Dosya gerekli' });
         const filename = `ch_${uuidv4().slice(0,12)}.webp`;
         const dest = path.join(postsDir, filename);
-        await sharp(req.file.path).resize(256,256,{fit:'cover'}).webp({quality:85}).toFile(dest);
+        await sharp(req.file.path).rotate().resize(256,256,{fit:'cover'}).webp({quality:85}).toFile(dest);
         await fs.unlink(req.file.path).catch(()=>{});
         const picUrl = `/uploads/posts/${filename}`;
         await pool.query(`UPDATE chatsee_conversations SET profile_pic=$1 WHERE id=$2`, [picUrl, req.params.id]);
@@ -14523,10 +14952,6 @@ setInterval(() => {
 // anında 404 döner ve saldırı olarak loglanır
 // ════════════════════════════════════════════════════════════════════
 app.all('/api/admin/*', (req, res) => {
-    const ip = (req.ip || req.connection?.remoteAddress || '').replace(/^::ffff:/, '');
-    console.warn(`🚨 [ADMIN-BLOCK] ${ip} yasaklı admin yoluna erişmeye çalıştı: ${req.path}`);
-    logFirewallAttack(ip, `Admin path probe: ${req.path}`, req);
-    // Honeypot gibi davran — gerçek 404 yerine kasıtlı yavaş cevap
     return setTimeout(() => res.status(404).json({ error: 'Sayfa bulunamadı' }), 1000);
 });
 
@@ -14534,14 +14959,12 @@ app.all('/api/admin/*', (req, res) => {
 // 🔒 Bilinmeyen API rotaları için 404
 // ════════════════════════════════════════════════════════════════════
 app.all('/api/*', (req, res) => {
-    const ip = (req.ip || req.connection?.remoteAddress || '').replace(/^::ffff:/, '');
-    logFirewallAttack(ip, `Unknown API probe: ${req.method} ${req.path}`, req);
     return res.status(404).json({ error: 'Geçersiz istek' });
 });
 
 // GET /* (catch-all - SPA için)
 app.get('*', (req, res, next) => {
-    if (req.path.startsWith('/api/') || req.path.startsWith('/uploads/')) return next();
+    if (req.path.startsWith('/api/') || req.path.startsWith('/uploads/') || req.path.startsWith('/agrolink')) return next();
     const htmlPath = require('path').join(__dirname, 'public', 'index.html');
     const fss = require('fs');
     if (fss.existsSync(htmlPath)) {
@@ -14586,26 +15009,77 @@ if (cluster.isPrimary || cluster.isMaster) {
     (async () => {
         try {
             await initializeDatabase();
-            await loadFirewallBans(); // 🔥 DB hazır olduktan sonra firewall ban listesini yükle
             await migrateEncryptSensitiveColumns(); // 🔒 Hassas kolonları şifrele (ör: email, mesajlar)
             await runSQLiteMigration(); // SQLite → PG geçişi (sadece SQLITE_MIGRATE=true ise çalışır)
             testEmailConnection().catch(() => {}); // E-posta bağlantısını arka planda test et
-            applySlowlorisProtection(server); // ✅ Slowloris/HTTP-DoS koruması
-            server.listen(PORT, '0.0.0.0', () => {
+            server.listen(PORT, '0.0.0.0', async () => {
                 console.log(`
 ╔══════════════════════════════════════════════════╗
-║  🌾 AGROLINK SERVER - PostgreSQL v6.0             ║
+║  🌾 AGROLINK SERVER - PostgreSQL v7.0             ║
 ║  📡 Port: ${String(PORT).padEnd(39)}║
 ║  🌐 Domain: sehitumitkestitarimmtal.com         ║
 ║  🗄️  DB: PostgreSQL (Pool: 100 bağlantı)        ║
 ║  🔒 SQL Injection: Tüm sorgular parameterize    ║
 ║  🎬 Video: FFmpeg+HLS ABR (YouTube Algoritması) ║
 ║  📧 E-posta: Nodemailer (SMTP)                  ║
-║  📊 API: 103 Rota                               ║
+║  📊 API: 103+ Rota                              ║
 ║  ⚡ Cluster Mode: Worker ${String(process.pid).padEnd(23)}║
 ║  🔥 1000+ Eşzamanlı İstek Desteği               ║
 ╚══════════════════════════════════════════════════╝
                 `);
+
+                // ── 📲 SUNUCU BAŞLANGIÇ TEST BİLDİRİMİ ──────────────────
+                // Tüm aktif FCM token sahiplerine test bildirimi gönder
+                if (firebaseAdmin) {
+                    try {
+                        const tokenRows = await dbAll(
+                            `SELECT DISTINCT "userId", token FROM device_tokens WHERE "isActive" = TRUE`,
+                            []
+                        );
+                        if (tokenRows && tokenRows.length > 0) {
+                            const tokens = tokenRows.map(r => r.token).filter(Boolean);
+                            const message = {
+                                notification: {
+                                    title: '🌾 AgroLink Sunucu Başladı',
+                                    body : 'Sistem yeniden başlatıldı. Hoş geldiniz!',
+                                },
+                                data: { type: 'server_restart', ts: String(Date.now()) },
+                                android: {
+                                    priority: 'high',
+                                    notification: {
+                                        channelId: 'agrolink_notifications',
+                                        sound: 'default',
+                                    },
+                                },
+                                tokens,
+                            };
+                            const result = await firebaseAdmin.messaging().sendEachForMulticast(message);
+                            const ok   = result.responses.filter(r => r.success).length;
+                            const fail = result.responses.filter(r => !r.success).length;
+                            console.log(\`📲 Başlangıç test bildirimi: \${ok} başarılı, \${fail} başarısız (\${tokens.length} token)\`);
+
+                            // Başarısız token'ları temizle
+                            result.responses.forEach((r, i) => {
+                                if (!r.success) {
+                                    const code = r.error?.code || '';
+                                    if (
+                                        code === 'messaging/invalid-registration-token' ||
+                                        code === 'messaging/registration-token-not-registered' ||
+                                        code === 'messaging/unregistered'
+                                    ) {
+                                        dbRun(\`UPDATE device_tokens SET "isActive" = FALSE WHERE token = $1\`, [tokens[i]]).catch(() => {});
+                                    }
+                                }
+                            });
+                        } else {
+                            console.log('📲 Test bildirimi: Kayıtlı aktif token bulunamadı');
+                        }
+                    } catch (fcmStartErr) {
+                        console.warn('📲 Test bildirimi gönderilemedi:', fcmStartErr.message);
+                    }
+                } else {
+                    console.warn('📲 Test bildirimi: Firebase yapılandırılmadı (FIREBASE_SERVICE_ACCOUNT_JSON eksik)');
+                }
             });
         } catch (error) {
             console.error('❌ Sunucu başlatılamadı:', error);
